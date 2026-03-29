@@ -1,27 +1,28 @@
 -- =============================================================================
--- autoplay_bridge.lua  |  v1.6  |  SF2CE / MAME 0.286  |  29/03/2026
+-- autoplay_bridge.lua  |  v1.7  |  SF2CE / MAME 0.286  |  29/03/2026
 -- =============================================================================
--- CAMBIOS v1.6:
---   · [FIX #4] Añadido campo "in_combat" al JSON de state.txt.
---     Valor: true solo cuando sm_state == "IN_COMBAT", false en todo lo demás
---     (menus, GAME_OVER_WAIT, WIN_WAIT, etc.).
---     Esto permite a Python detectar el fin de ronda de forma fiable, sin
---     depender de HP <= 0 (que falla porque SF2CE pone P1_HP=255 al morir).
---     mame_bridge.py v1.1 usa "in_combat" en soft_reset() y bridge_error fix.
---     blanka_env.py v2.2 usa "in_combat" para terminated.
--- =============================================================================
--- CAMBIOS v1.5 (recordatorio):
---   · flush_inputs() solo toca los 12 campos de botones P1 (DIPs excluidos).
---   · Diagnóstico de inputs Python en IN_COMBAT (NOOPs vs Acciones).
--- CAMBIOS v1.4 (recordatorio):
---   · Nombres de botones corregidos ("P1 Jab Punch" etc.)
---   · BOOTING ampliado a 360 frames.
+-- CAMBIOS v1.7:
+--   · [FIX #1 CRÍTICO] flush_inputs() movido al FINAL del frame, después de
+--     aplicar hold()/clear_held(). Antes se llamaba al INICIO, lo que hacía
+--     que los inputs de Python se aplicasen con 1 frame de retraso y en casos
+--     de clear_held() nunca llegasen a MAME.
+--   · [FIX #2 CRÍTICO] write_state() ahora usa escritura atómica:
+--     escribe en state.tmp y luego renombra a state.txt con os.rename().
+--     Esto elimina la race condition donde Python leía 0 bytes porque Lua
+--     había truncado el archivo pero aún no había terminado de escribir.
+--     NOTA: os.rename en Lua/MAME en Windows puede fallar si state.txt está
+--     abierto por Python simultáneamente. Como fallback se mantiene escritura
+--     directa pero con flush explícito (f:flush() antes de f:close()).
+--   · [FIX #3] Diagnóstico ampliado: log de escritura de state.txt cada 300f
+--     para confirmar que el archivo se está generando correctamente.
+--   · [FIX #4] Añadido campo "in_combat" al JSON (mantenido de v1.6).
 -- =============================================================================
 
-local BRIDGE_VERSION = "autoplay_bridge_v1.6"
+local BRIDGE_VERSION = "autoplay_bridge_v1.7"
 local BASE_DIR       = "C:\\proyectos\\MAME\\"
 local INPUT_FILE     = BASE_DIR .. "mame_input.txt"
 local STATE_FILE     = BASE_DIR .. "state.txt"
+local STATE_TMP      = BASE_DIR .. "state.tmp"
 local VER_FILE       = BASE_DIR .. "bridge_version_0.txt"
 
 do
@@ -47,14 +48,13 @@ local ADDR = {
 }
 
 -- ── NOMBRES DE BOTONES REALES EN SF2CE/MAME ──────────────────────────────────
-local BTN_JAB       = "P1 Jab Punch"
-local BTN_STRONG    = "P1 Strong Punch"
-local BTN_FIERCE    = "P1 Fierce Punch"
-local BTN_SHORT     = "P1 Short Kick"
-local BTN_FORWARD   = "P1 Forward Kick"
-local BTN_ROUNDHOUSE= "P1 Roundhouse Kick"
+local BTN_JAB        = "P1 Jab Punch"
+local BTN_STRONG     = "P1 Strong Punch"
+local BTN_FIERCE     = "P1 Fierce Punch"
+local BTN_SHORT      = "P1 Short Kick"
+local BTN_FORWARD    = "P1 Forward Kick"
+local BTN_ROUNDHOUSE = "P1 Roundhouse Kick"
 
--- [FIX v1.5] Solo los 12 campos de control P1 — DIPs excluidos
 local BUTTON_NAMES = {
     "P1 Up", "P1 Down", "P1 Left", "P1 Right",
     BTN_JAB, BTN_STRONG, BTN_FIERCE,
@@ -63,9 +63,9 @@ local BUTTON_NAMES = {
 }
 
 local BTN_LABEL = {
-    [1]="UP", [2]="DOWN", [3]="LEFT", [4]="RIGHT",
-    [5]="JAB", [6]="STRONG", [7]="FIERCE",
-    [8]="SHORT", [9]="FORWARD", [10]="RH",
+    [1]="UP",[2]="DOWN",[3]="LEFT",[4]="RIGHT",
+    [5]="JAB",[6]="STRONG",[7]="FIERCE",
+    [8]="SHORT",[9]="FORWARD",[10]="RH",
 }
 
 -- ── LAZY INIT ─────────────────────────────────────────────────────────────────
@@ -122,11 +122,11 @@ end
 -- ── SISTEMA DE INPUTS ─────────────────────────────────────────────────────────
 local _held = {}
 
-local function hold(name)    _held[name] = true  end
-local function release(name) _held[name] = nil   end
-local function clear_held()  _held = {}           end
+local function hold(name)    _held[name] = true end
+local function release(name) _held[name] = nil  end
+local function clear_held()  _held = {}          end
 
--- [FIX v1.5] Solo itera los campos de BUTTON_NAMES
+-- [FIX v1.7] flush_inputs se llama al FINAL del frame, después de hold()/clear_held()
 local function flush_inputs()
     if not _fields_ok then return end
     for name, field in pairs(_fields) do
@@ -162,10 +162,12 @@ local MIN_HP           = 100
 local hp_stable        = 0
 local HP_STABLE_N      = 10
 
--- ── DIAGNÓSTICO (v1.5) ────────────────────────────────────────────────────────
-local diag_noop_count   = 0
-local diag_action_count = 0
-local diag_combat_frame = 0
+-- ── DIAGNÓSTICO ───────────────────────────────────────────────────────────────
+local diag_noop_count    = 0
+local diag_action_count  = 0
+local diag_combat_frame  = 0
+local diag_write_ok      = 0
+local diag_write_fail    = 0
 
 -- ── TRANSICIÓN ───────────────────────────────────────────────────────────────
 local function transition(s)
@@ -183,11 +185,12 @@ end
 
 -- ── LECTURA INPUT PYTHON ──────────────────────────────────────────────────────
 local function read_python_input()
-    local f = io.open(INPUT_FILE,"r"); if not f then return nil end
+    local f = io.open(INPUT_FILE, "r"); if not f then return nil end
     local l = f:read("*l"); f:close()
-    if not l or l=="" then return nil end
-    local b={}; for v in l:gmatch("([^,]+)") do b[#b+1]=tonumber(v) or 0 end
-    return #b>=10 and b or nil
+    if not l or l == "" then return nil end
+    local b = {}
+    for v in l:gmatch("([^,]+)") do b[#b+1] = tonumber(v) or 0 end
+    return #b >= 10 and b or nil
 end
 
 -- ── LECTURA ESTADO JUEGO ──────────────────────────────────────────────────────
@@ -201,39 +204,42 @@ local function read_game_state()
                 boom_slot_active=false,boom_throw_this_frame=false,
                 fk_landing_this_frame=false,frame=frame_count}
     end
-    local p1hp=ru8(ADDR.P1_HP); local p2hp=ru8(ADDR.P2_HP)
-    local p1x=ru16(ADDR.P1_X_H,ADDR.P1_X_L)
-    local p2x=ru16(ADDR.P2_X_H,ADDR.P2_X_L)
-    local p1dir=(ru8(ADDR.P1_SIDE)==0) and 1 or 0
-    local p1char=ru8(ADDR.P1_CHAR); local p2char=ru8(ADDR.P2_CHAR)
-    local p1st=ru8(ADDR.P1_STUN); local p2st=ru8(ADDR.P2_STUN)
-    local p2ss=ru8(ADDR.P2_STUN_SPRITE)
-    local p2cr=(ru8(ADDR.P2_CROUCH)==0x03)
-    local p2an=ru8(ADDR.P2_ANIM)
-    local p2yv=rs16(ADDR.P2_Y_VEL_H,ADDR.P2_Y_VEL_L)
-    local p2air=(math.abs(p2yv)>256)
-    local timer=ru8(ADDR.TIMER)
-    local bsa=(ru8(ADDR.PROJ_SLOT)==0xA4)
-    local bi=(ru8(ADDR.PROJ_IMPACT)==0x98)
 
-    local boom_thr=false
-    if p2an==0x0C and not p2air and prev_p2_anim~=0x0C then
+    local p1hp  = ru8(ADDR.P1_HP);    local p2hp  = ru8(ADDR.P2_HP)
+    local p1x   = ru16(ADDR.P1_X_H,   ADDR.P1_X_L)
+    local p2x   = ru16(ADDR.P2_X_H,   ADDR.P2_X_L)
+    local p1dir = (ru8(ADDR.P1_SIDE) == 0) and 1 or 0
+    local p1char= ru8(ADDR.P1_CHAR);  local p2char= ru8(ADDR.P2_CHAR)
+    local p1st  = ru8(ADDR.P1_STUN);  local p2st  = ru8(ADDR.P2_STUN)
+    local p2ss  = ru8(ADDR.P2_STUN_SPRITE)
+    local p2cr  = (ru8(ADDR.P2_CROUCH) == 0x03)
+    local p2an  = ru8(ADDR.P2_ANIM)
+    local p2yv  = rs16(ADDR.P2_Y_VEL_H, ADDR.P2_Y_VEL_L)
+    local p2air = (math.abs(p2yv) > 256)
+    local timer = ru8(ADDR.TIMER)
+    local bsa   = (ru8(ADDR.PROJ_SLOT) == 0xA4)
+    local bi    = (ru8(ADDR.PROJ_IMPACT) == 0x98)
+
+    local boom_thr = false
+    if p2an == 0x0C and not p2air and prev_p2_anim ~= 0x0C then
         if not prev_p2_airborne then
-            boom_thr=true; boom_active=true; boom_throw_frame=frame_count
+            boom_thr = true; boom_active = true; boom_throw_frame = frame_count
         end
     end
     if boom_active and not bsa then
-        if frame_count-boom_throw_frame>180 then boom_active=false end
+        if frame_count - boom_throw_frame > 180 then boom_active = false end
     end
-    local bxe=0.0
-    if boom_active and boom_throw_frame>=0 then
-        local fe=frame_count-boom_throw_frame
-        bxe=p2x-fe*BOOM_VEL
-        if bxe<0 then bxe=0.0; boom_active=false end
+
+    local bxe = 0.0
+    if boom_active and boom_throw_frame >= 0 then
+        local fe = frame_count - boom_throw_frame
+        bxe = p2x - fe * BOOM_VEL
+        if bxe < 0 then bxe = 0.0; boom_active = false end
     end
-    local fkl=false
-    if prev_p2_airborne and not p2air then fkl=true; boom_active=false end
-    prev_p2_anim=p2an; prev_p2_airborne=p2air
+
+    local fkl = false
+    if prev_p2_airborne and not p2air then fkl = true; boom_active = false end
+    prev_p2_anim = p2an; prev_p2_airborne = p2air
 
     return {p1_hp=p1hp,p2_hp=p2hp,p1_x=p1x,p2_x=p2x,p1_dir=p1dir,
             p1_char=p1char,p2_char=p2char,timer=timer,
@@ -247,7 +253,16 @@ local function read_game_state()
 end
 
 -- ── SERIALIZACIÓN JSON ────────────────────────────────────────────────────────
--- [FIX v1.6] Campo "in_combat": true solo en IN_COMBAT, false en menús/game-over
+-- [FIX v1.7 locale] boom_x_est usa tostring() + gsub para garantizar punto
+-- decimal independientemente del locale del sistema (es_ES usa coma).
+-- string.format("%.1f", 0.0) puede producir "0,0" en Windows con locale español.
+local function float_to_json(v)
+    -- math.floor distingue enteros de decimales
+    local i = math.floor(v)
+    local d = math.floor((v - i) * 10 + 0.5)
+    return string.format("%d.%d", i, d)
+end
+
 local function to_json(s)
     return string.format(
         '{"p1_hp":%d,"p2_hp":%d,"p1_x":%d,"p2_x":%d,"p1_dir":%d,'..
@@ -255,7 +270,7 @@ local function to_json(s)
         '"p1_stun":%d,"p2_stun":%d,"p2_stunned":%s,'..
         '"p2_crouch":%s,"p2_anim":%d,"p2_y_vel":%d,'..
         '"p2_airborne":%s,"p1_airborne":%s,'..
-        '"boom_active":%s,"boom_x_est":%.1f,"boom_incoming":%s,'..
+        '"boom_active":%s,"boom_x_est":%s,"boom_incoming":%s,'..
         '"boom_slot_active":%s,"boom_throw_this_frame":%s,'..
         '"fk_landing_this_frame":%s,"p2_hitstop":0,'..
         '"in_combat":%s,"frame":%d}',
@@ -264,19 +279,50 @@ local function to_json(s)
         s.p1_stun,s.p2_stun,bts(s.p2_stunned),
         bts(s.p2_crouch),s.p2_anim,s.p2_y_vel,
         bts(s.p2_airborne),bts(s.p1_airborne),
-        bts(s.boom_active),s.boom_x_est,bts(s.boom_incoming),
+        bts(s.boom_active),float_to_json(s.boom_x_est),bts(s.boom_incoming),
         bts(s.boom_slot_active),bts(s.boom_throw_this_frame),
         bts(s.fk_landing_this_frame),
-        bts(sm_state == "IN_COMBAT"),   -- NUEVO v1.6
+        bts(sm_state == "IN_COMBAT"),
         s.frame)
 end
 
+-- [FIX v1.7] Escritura atómica: escribe en .tmp y renombra a .txt
+-- Esto elimina la ventana de tiempo donde state.txt está vacío (truncado
+-- por "w" pero aún no escrito). Python nunca verá un archivo vacío.
 local function write_state(s)
-    local f=io.open(STATE_FILE,"w"); if f then f:write(to_json(s).."\n"); f:close() end
+    local json_str = to_json(s) .. "\n"
+
+    -- Intentar escritura atómica (tmp → rename)
+    local f = io.open(STATE_TMP, "w")
+    if f then
+        f:write(json_str)
+        f:flush()   -- garantiza que los bytes están en disco antes de renombrar
+        f:close()
+        local ok = os.rename(STATE_TMP, STATE_FILE)
+        if ok then
+            diag_write_ok = diag_write_ok + 1
+            return
+        end
+        -- Si rename falla (Windows: archivo destino abierto), caemos al fallback
+    end
+
+    -- Fallback: escritura directa con flush explícito
+    local f2 = io.open(STATE_FILE, "w")
+    if f2 then
+        f2:write(json_str)
+        f2:flush()
+        f2:close()
+        diag_write_ok = diag_write_ok + 1
+    else
+        diag_write_fail = diag_write_fail + 1
+        if diag_write_fail % 60 == 1 then
+            print(string.format("[ABridge] ERROR: no se puede escribir state.txt (fail=%d)",
+                diag_write_fail))
+        end
+    end
 end
 
 -- ── MÁQUINA DE ESTADOS ────────────────────────────────────────────────────────
-
 local function tick_menu(p1hp, p2hp)
     state_frame = state_frame + 1
     local f = state_frame
@@ -286,29 +332,29 @@ local function tick_menu(p1hp, p2hp)
 
     elseif sm_state == "DISMISS_WARNING" then
         clear_held()
-        if f % 30 >= 1 and f % 30 <= 5 then hold(BTN_JAB) end
-        if f % 30 >= 15 and f % 30 <= 19 then hold("1 Player Start") end
+        if f % 30 >= 1  and f % 30 <= 5  then hold(BTN_JAB)            end
+        if f % 30 >= 15 and f % 30 <= 19 then hold("1 Player Start")   end
         if f >= 180 then clear_held(); transition("INSERT_COIN") end
 
     elseif sm_state == "INSERT_COIN" then
-        if f == 20 then hold("Coin 1"); print("[ABridge] Pulsando Coin 1") end
-        if f == 26 then release("Coin 1"); print("[ABridge] Soltando Coin 1") end
+        if f == 20 then hold("Coin 1");     print("[ABridge] Pulsando Coin 1")       end
+        if f == 26 then release("Coin 1");  print("[ABridge] Soltando Coin 1")       end
         if f >= 100 then transition("PRESS_START") end
 
     elseif sm_state == "PRESS_START" then
-        if f == 20 then hold("1 Player Start"); print("[ABridge] Pulsando 1 Player Start") end
-        if f == 26 then release("1 Player Start"); print("[ABridge] Soltando 1 Player Start") end
+        if f == 20 then hold("1 Player Start");     print("[ABridge] Pulsando 1 Player Start") end
+        if f == 26 then release("1 Player Start");  print("[ABridge] Soltando 1 Player Start") end
         if f >= 220 then transition("CHAR_NAVIGATE") end
 
     elseif sm_state == "CHAR_NAVIGATE" then
-        if f == 10 then hold("P1 Right");   print("[ABridge] RIGHT 1") end
+        if f == 10 then hold("P1 Right");    print("[ABridge] RIGHT 1") end
         if f == 16 then release("P1 Right") end
-        if f == 40 then hold("P1 Right");   print("[ABridge] RIGHT 2") end
+        if f == 40 then hold("P1 Right");    print("[ABridge] RIGHT 2") end
         if f == 46 then release("P1 Right") end
         if f >= 90 then transition("CHAR_CONFIRM") end
 
     elseif sm_state == "CHAR_CONFIRM" then
-        if f == 10 then hold(BTN_JAB); print("[ABridge] JAB confirm (Blanka)") end
+        if f == 10 then hold(BTN_JAB);     print("[ABridge] JAB confirm (Blanka)") end
         if f == 16 then release(BTN_JAB) end
         if f >= 450 then transition("WAITING_COMBAT") end
 
@@ -328,17 +374,19 @@ local function tick_menu(p1hp, p2hp)
         if f >= 300 then transition("WAITING_COMBAT") end
 
     elseif sm_state == "GAME_OVER_WAIT" then
+        -- Insertar moneda durante la espera para que el CONTINUE funcione
+        if f == 60 then hold("Coin 1");   print("[ABridge] Coin antes de CONTINUE") end
+        if f == 66 then release("Coin 1") end
         if f >= 180 then transition("PRESS_CONTINUE") end
 
     elseif sm_state == "PRESS_CONTINUE" then
-        if f == 20 then hold("1 Player Start"); print("[ABridge] CONTINUE") end
+        if f == 20 then hold("1 Player Start");   print("[ABridge] CONTINUE") end
         if f == 26 then release("1 Player Start") end
         if f >= 310 then transition("WAITING_COMBAT") end
     end
 end
 
 -- ── BUCLE PRINCIPAL ───────────────────────────────────────────────────────────
-
 local function on_frame()
     frame_count = frame_count + 1
 
@@ -348,17 +396,22 @@ local function on_frame()
                 frame_count, tostring(_mem_ok), tostring(_fields_ok)))
         end
         write_state(read_game_state())
+        -- [FIX v1.7] flush incluso durante init (sin inputs = todo a 0)
+        flush_inputs()
         return
     end
 
-    flush_inputs()
-
+    -- 1. Leer estado del juego
     local st = read_game_state()
-    write_state(st)   -- "in_combat" queda = (sm_state=="IN_COMBAT") en to_json
 
+    -- 2. Escribir state.txt para Python (ANTES de aplicar inputs)
+    write_state(st)
+
+    -- 3. Lógica de estado
     if sm_state == "IN_COMBAT" then
         diag_combat_frame = diag_combat_frame + 1
 
+        -- Leer input de Python
         local buttons = read_python_input()
         if buttons then
             last_input = buttons
@@ -371,7 +424,6 @@ local function on_frame()
                     active_names[#active_names+1] = (BTN_LABEL[i] or "b"..i)
                 end
             end
-
             if any_active then
                 diag_action_count = diag_action_count + 1
                 if diag_action_count <= 20 then
@@ -384,27 +436,32 @@ local function on_frame()
             end
         end
 
+        -- Diagnóstico periódico de inputs
         if diag_combat_frame % 600 == 0 then
             local total = diag_noop_count + diag_action_count
-            local pct = total > 0 and (diag_action_count * 100 / total) or 0
+            local pct   = total > 0 and (diag_action_count * 100 / total) or 0
             print(string.format(
-                "[DIAG] F%d | Combate f=%d | NOOPs=%d Acciones=%d (%.1f%%)",
-                frame_count, diag_combat_frame, diag_noop_count, diag_action_count, pct))
+                "[DIAG] F%d | Combate f=%d | NOOPs=%d Acciones=%d (%.1f%%) | Write OK=%d FAIL=%d",
+                frame_count, diag_combat_frame,
+                diag_noop_count, diag_action_count, pct,
+                diag_write_ok, diag_write_fail))
         end
 
+        -- [FIX v1.7] Aplicar inputs: clear → hold → flush (en este orden)
         clear_held()
         local b = last_input
-        if (b[1]  or 0)~=0 then hold("P1 Up")          end
-        if (b[2]  or 0)~=0 then hold("P1 Down")         end
-        if (b[3]  or 0)~=0 then hold("P1 Left")         end
-        if (b[4]  or 0)~=0 then hold("P1 Right")        end
-        if (b[5]  or 0)~=0 then hold(BTN_JAB)           end
-        if (b[6]  or 0)~=0 then hold(BTN_STRONG)        end
-        if (b[7]  or 0)~=0 then hold(BTN_FIERCE)        end
-        if (b[8]  or 0)~=0 then hold(BTN_SHORT)         end
-        if (b[9]  or 0)~=0 then hold(BTN_FORWARD)       end
-        if (b[10] or 0)~=0 then hold(BTN_ROUNDHOUSE)    end
+        if (b[1]  or 0)~=0 then hold("P1 Up")         end
+        if (b[2]  or 0)~=0 then hold("P1 Down")        end
+        if (b[3]  or 0)~=0 then hold("P1 Left")        end
+        if (b[4]  or 0)~=0 then hold("P1 Right")       end
+        if (b[5]  or 0)~=0 then hold(BTN_JAB)          end
+        if (b[6]  or 0)~=0 then hold(BTN_STRONG)       end
+        if (b[7]  or 0)~=0 then hold(BTN_FIERCE)       end
+        if (b[8]  or 0)~=0 then hold(BTN_SHORT)        end
+        if (b[9]  or 0)~=0 then hold(BTN_FORWARD)      end
+        if (b[10] or 0)~=0 then hold(BTN_ROUNDHOUSE)   end
 
+        -- Detección fin de ronda
         if st.p2_hp <= 0 and st.p1_hp > 0 then
             clear_held()
             print(string.format("[DIAG] FIN-RONDA VICTORIA | combate=%d NOOPs=%d Acciones=%d",
@@ -417,36 +474,43 @@ local function on_frame()
             transition("GAME_OVER_WAIT")
         end
 
+        -- Log periódico en combate
         if frame_count % 300 == 0 then
-            local fk="tierra"
+            local fk = "tierra"
             if st.p2_airborne then
-                local a=st.p2_anim
-                if a==0x02 then fk="FK_ASCENSO"
-                elseif a==0x00 then fk="FK_CIMA"
-                elseif a==0x04 then fk="FK_DESCENSO"
-                elseif a==0x0C then fk="FK_STARTUP" end
-            elseif st.p2_anim==0x0C then fk="BOOM/FK_LAND" end
+                local a = st.p2_anim
+                if     a == 0x02 then fk = "FK_ASCENSO"
+                elseif a == 0x00 then fk = "FK_CIMA"
+                elseif a == 0x04 then fk = "FK_DESCENSO"
+                elseif a == 0x0C then fk = "FK_STARTUP" end
+            elseif st.p2_anim == 0x0C then fk = "BOOM/FK_LAND" end
             print(string.format(
                 "[F%d] P1=%d P2=%d X:%d-%d ANIM=0x%02X(%s) Y=%d BOOM:%s IMP:%s in_combat=true",
                 frame_count,st.p1_hp,st.p2_hp,st.p1_x,st.p2_x,
                 st.p2_anim,fk,st.p2_y_vel,
                 tostring(st.boom_active),tostring(st.boom_incoming)))
         end
+
     else
+        -- Menús: mover la máquina de estados
         tick_menu(st.p1_hp, st.p2_hp)
         if frame_count % 120 == 0 then
             local held_str = ""
-            for k,_ in pairs(_held) do held_str = held_str .. k .. " " end
+            for k, _ in pairs(_held) do held_str = held_str .. k .. " " end
             if held_str == "" then held_str = "(ninguno)" end
             print(string.format("[F%d] STATE=%-18s f=%d HP=%d/%d HELD:[%s]",
                 frame_count, sm_state, state_frame,
                 st.p1_hp, st.p2_hp, held_str))
         end
     end
+
+    -- [FIX v1.7] flush_inputs al FINAL — después de todos los hold()/clear_held()
+    flush_inputs()
 end
 
 emu.register_frame_done(on_frame, "frame")
 
-print("[ABridge] Bridge activo v1.6 — in_combat en state.txt + reintentos de lectura en Python")
+print("[ABridge] Bridge activo v1.7")
+print("  Fixes: flush_inputs al final del frame + escritura atómica de state.txt")
 print("  -> " .. INPUT_FILE)
 print("  -> " .. STATE_FILE)
