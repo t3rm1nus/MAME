@@ -1,0 +1,1 @@
+frame=1170 p1hp=0 p2hp=0 p1chr=0 p2chr=0

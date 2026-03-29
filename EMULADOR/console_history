@@ -1,0 +1,18 @@
+m=manager.machine.devices[":maincpu"].spaces["program"]; for a=0xFF8700,0xFF8800 do local v=m:read_u8(a) if v>0 and v<200 then print(string.format("0x%06X = %d (0x%02X)", a, v, v)) end end
+m=manager.machine.devices[":maincpu"].spaces["program"]; for a=0xFF8700,0xFF8800 do local v=m:read_u8(a) if v>0 and v<200 then print(string.format("0x%06X = %d (0x%02X)", a, v, v)) end endm=manager.machine.devices[":maincpu"].spaces["program"]; for a=0xFF8700,0xFF8800 do local v=m:read_u8(a) if v>0 and v<200 then print(string.format("0x%06X = %d (0x%02X)", a, v, v)) end end
+m=manager.machine.devices[":maincpu"].spaces["program"]; for a=0xFF8700,0xFF8800 do local v=m:read_u8(a) if v>0 and v<200 then print(string.format("0x%06X = %d (0x%02X)", a, v, v)) end end
+m=manager.machine.devices[":maincpu"].spaces["program"]; print("P2_CHAR_SELECT=",m:read_u8(0xFF874F),"P2_HP=",m:read_u8(0xFF86E9),"P1_HP=",m:read_u8(0xFF83E9))
+m=manager.machine.devices[":maincpu"].spaces["program"]; for a=0xFF8600,0xFF8800 do local v=m:read_u8(a) if v>0 and v<144 then print(string.format("0x%06X = %d", a, v)) end end
+m=manager.machine.devices[":maincpu"].spaces["program"]; print("P2_HP_REAL=",m:read_u8(0xFF865C),"P2_CHAR=",m:read_u8(0xFF864F),"P2_ACTION=",m:read_u8(0xFF8741))
+m=manager.machine.devices[":maincpu"].spaces["program"]; print("A=",m:read_u8(0xFF86E9),"B=",m:read_u8(0xFF865C),"C=",m:read_u8(0xFF8741),"D=",m:read_u8(0xFF874F))
+xxxm=manager.machine.devices[":maincpu"].spaces["program"]; print("A=",m:read_u8(0xFF86E9),"B=",m:read_u8(0xFF865C),"C=",m:read_u8(0xFF8741),"D=",m:read_u8(0xFF874F))
+xm=manager.machine.devices[":maincpu"].spaces["program"]; print("A=",m:read_u8(0xFF86E9),"B=",m:read_u8(0xFF865C),"C=",m:read_u8(0xFF8741),"D=",m:read_u8(0xFF874F))
+m=manager.machine.devices[":maincpu"].spaces["program"]; print("P2_HP=",m:read_u8(0xFF86E9),"P2_ACTION=",m:read_u8(0xFF8741),"P2_ACTION_OLD=",m:read_u8(0xFF8751))
+m=manager.machine.devices[":maincpu"].spaces["program"]; for a=0xFF8600,0xFF8900,2 do local v=m:read_u8(a) if v>5 and v<144 then print(string.format("0x%06X=%d",a,v)) end end
+m=manager.machine.devices[":maincpu"].spaces["program"]; print("A=",m:read_u8(0xFF864F),"B=",m:read_u8(0xFF874F),"C=",m:read_u8(0xFF865C),"D=",m:read_u8(0xFF86E9))
+m=manager.machine.devices[":maincpu"].spaces["program"]; print("P1=",m:read_u8(0xFF864F),"P2_A=",m:read_u8(0xFF874F),"P2_B=",m:read_u8(0xFF8652),"P2_C=",m:read_u8(0xFF8753),"P2_D=",m:read_u8(0xFF8450))
+m=manager.machine.devices[":maincpu"].spaces["program"]; for a=0xFF8000,0xFF9000 do local v=m:read_u8(a) if v>=1 and v<=11 then print(string.format("0x%06X=%d",a,v)) end end
+  m=manager.machine.devices[":maincpu"].spaces["program"]; for a=0xFF8000,0xFF9000 do local v=m:read_u8(a) if v>=1 and v<=11 then print(string.format("0x%06X=%d",a,v)) end end
+m=manager.machine.devices[":maincpu"].spaces["program"]; for a=0xFF8000,0xFF9000 do local v=m:read_u8(a) if v>=1 and v<=11 then print(string.format("0x%06X=%d",a,v)) end end
+print(emu.app_version())
+

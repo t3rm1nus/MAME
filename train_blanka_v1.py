@@ -2,7 +2,7 @@
 """
 train_blanka_v1.py — SF2CE PPO Blanka | Flujo único (lanza MAME + entrena)
 ===========================================================================
-Versión: 1.0 (28/03/2026)
+Versión: 1.1 (29/03/2026)
 
 USO:
   # Entrenamiento nuevo (lanza MAME automáticamente):
@@ -206,6 +206,7 @@ class MetricsCallback(BaseCallback):
         self._roll_uses  = 0
         self._elec_uses  = 0
         self._fk_rolls   = 0
+        self._rjump_uses = 0   # acción 23: rolling desde salto atrás
         self._last_roll  = -1
         self._first_win  = False
         self._rival_eps: dict = {}
@@ -221,6 +222,7 @@ class MetricsCallback(BaseCallback):
 
         if action == 15: self._roll_uses += 1
         if action == 16: self._elec_uses += 1
+        if action == 23: self._rjump_uses += 1  # rolling desde salto atrás
         if action == 15 and 0 < fk_land <= 20: self._fk_rolls += 1
 
         if "episode" in info:
@@ -260,6 +262,7 @@ class MetricsCallback(BaseCallback):
         print(f"  Win rate  : {wr:.1f}%  (últimos {len(self._ep_wins)})")
         print(f"  Avg len   : {avg_len:.0f}  | Avg P2 dmg: {avg_dmg:.1f}")
         print(f"  Rolling   : {self._roll_uses} usos")
+        print(f"  Roll-Jump : {self._rjump_uses} usos  (acción 23)")
         print(f"  Electric  : {self._elec_uses} usos")
         print(f"  FK+Rolling: {self._fk_rolls}")
         print(f"  Rival     : {rname}")
@@ -274,9 +277,10 @@ class MetricsCallback(BaseCallback):
         self.logger.record("sf2/win_rate",      wr)
         self.logger.record("sf2/avg_len",       avg_len)
         self.logger.record("sf2/avg_p2_damage", avg_dmg)
-        self.logger.record("sf2/rolling_uses",  self._roll_uses)
-        self.logger.record("sf2/electric_uses", self._elec_uses)
-        self.logger.record("sf2/fk_rolling",    self._fk_rolls)
+        self.logger.record("sf2/rolling_uses",    self._roll_uses)
+        self.logger.record("sf2/rolling_jump_uses", self._rjump_uses)
+        self.logger.record("sf2/electric_uses",   self._elec_uses)
+        self.logger.record("sf2/fk_rolling",      self._fk_rolls)
         self.logger.dump(self.num_timesteps)
 
         if self._last_roll % 20 == 0:

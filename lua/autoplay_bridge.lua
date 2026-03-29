@@ -1,24 +1,26 @@
 -- =============================================================================
--- autoplay_bridge.lua  |  v1.7  |  SF2CE / MAME 0.286  |  29/03/2026
+-- autoplay_bridge.lua  |  v1.10 |  SF2CE / MAME 0.286  |  29/03/2026
 -- =============================================================================
--- CAMBIOS v1.7:
---   · [FIX #1 CRÍTICO] flush_inputs() movido al FINAL del frame, después de
---     aplicar hold()/clear_held(). Antes se llamaba al INICIO, lo que hacía
---     que los inputs de Python se aplicasen con 1 frame de retraso y en casos
---     de clear_held() nunca llegasen a MAME.
---   · [FIX #2 CRÍTICO] write_state() ahora usa escritura atómica:
---     escribe en state.tmp y luego renombra a state.txt con os.rename().
---     Esto elimina la race condition donde Python leía 0 bytes porque Lua
---     había truncado el archivo pero aún no había terminado de escribir.
---     NOTA: os.rename en Lua/MAME en Windows puede fallar si state.txt está
---     abierto por Python simultáneamente. Como fallback se mantiene escritura
---     directa pero con flush explícito (f:flush() antes de f:close()).
---   · [FIX #3] Diagnóstico ampliado: log de escritura de state.txt cada 300f
---     para confirmar que el archivo se está generando correctamente.
---   · [FIX #4] Añadido campo "in_combat" al JSON (mantenido de v1.6).
+-- CAMBIOS v1.10 (sobre v1.9):
+--   · [FIX CRÍTICO] WAITING_COMBAT: P1_HP=255 (0xFF) es el valor de muerte
+--     en SF2CE, NO vida completa. Añadido tope superior: p1hp <= 144 y
+--     p2hp <= 144. Sin este fix el bridge entraba en combate con Blanka
+--     muerta, causando el episodio de 155 frames inmediato.
+--   · [FIX] WAITING_COMBAT ahora exige que AMBOS HP sean válidos (1-144)
+--     para transicionar a IN_COMBAT.
+-- CAMBIOS v1.9 (mantenidos):
+--   · [FIX] PRESS_CONTINUE usa BTN_JAB en lugar de "1 Player Start".
+--     SF2CE acepta cualquier botón de ataque en la pantalla de CONTINUE.
+-- CAMBIOS v1.8 (mantenidos):
+--   · [NEW] Detección real de p1_airborne/p1_anim/p1_y_vel (antes siempre false).
+--     Bloque estado P1 en 0xFF8300 (mismo esquema de offsets que P2 en 0xFF8600).
+--   · [NEW] Campo p1_landing_this_frame: true exactamente el frame en que
+--     Blanka aterriza. Permite ejecutar Rolling cargado desde salto atrás
+--     con timing perfecto desde Python (acción 23 en blanka_env.py).
+--   · [MANTIENE] Todos los fixes de v1.7 (flush al final, escritura atómica).
 -- =============================================================================
 
-local BRIDGE_VERSION = "autoplay_bridge_v1.7"
+local BRIDGE_VERSION = "autoplay_bridge_v1.10"
 local BASE_DIR       = "C:\\proyectos\\MAME\\"
 local INPUT_FILE     = BASE_DIR .. "mame_input.txt"
 local STATE_FILE     = BASE_DIR .. "state.txt"
@@ -43,6 +45,10 @@ local ADDR = {
     P1_STUN=0xFF895A, P2_STUN=0xFF865A, P2_STUN_SPRITE=0xFF8951,
     P2_CROUCH=0xFF86C4, P2_ANIM=0xFF86C1,
     P2_Y_VEL_H=0xFF86FC, P2_Y_VEL_L=0xFF86FD,
+    -- [v1.8] P1 (Blanka) — bloque estado 0xFF8300, mismo esquema de offsets que P2
+    P1_ANIM=0xFF83C1,    -- +0xC1 como P2_ANIM    (0xFF86C1)
+    P1_Y_VEL_H=0xFF83FC, -- +0xFC como P2_Y_VEL_H (0xFF86FC)
+    P1_Y_VEL_L=0xFF83FD, -- +0xFD como P2_Y_VEL_L (0xFF86FD)
     PROJ_SLOT=0xFF8E30, PROJ_IMPACT=0xFF8E00,
     TIMER=0xFF8ACE,
 }
@@ -157,6 +163,7 @@ local boom_active      = false
 local boom_throw_frame = -1
 local prev_p2_anim     = 0
 local prev_p2_airborne = false
+local prev_p1_airborne = false   -- [v1.8] tracking airborne Blanka (P1)
 local BOOM_VEL         = 25
 local MIN_HP           = 100
 local hp_stable        = 0
@@ -199,7 +206,8 @@ local function read_game_state()
         return {p1_hp=0,p2_hp=0,p1_x=700,p2_x=700,p1_dir=1,
                 p1_char=0,p2_char=0,timer=99,p1_stun=0,p2_stun=0,
                 p2_stunned=false,p2_crouch=false,p2_anim=0,p2_y_vel=0,
-                p2_airborne=false,p1_airborne=false,
+                p2_airborne=false,
+                p1_anim=0,p1_y_vel=0,p1_airborne=false,p1_landing_this_frame=false,
                 boom_active=false,boom_x_est=0.0,boom_incoming=false,
                 boom_slot_active=false,boom_throw_this_frame=false,
                 fk_landing_this_frame=false,frame=frame_count}
@@ -216,6 +224,11 @@ local function read_game_state()
     local p2an  = ru8(ADDR.P2_ANIM)
     local p2yv  = rs16(ADDR.P2_Y_VEL_H, ADDR.P2_Y_VEL_L)
     local p2air = (math.abs(p2yv) > 256)
+    -- [v1.8] P1 (Blanka) airborne detection — mismo método que P2
+    local p1an  = ru8(ADDR.P1_ANIM)
+    local p1yv  = rs16(ADDR.P1_Y_VEL_H, ADDR.P1_Y_VEL_L)
+    local p1air = (math.abs(p1yv) > 256)
+    local p1land= prev_p1_airborne and not p1air   -- true SOLO el frame de aterrizaje
     local timer = ru8(ADDR.TIMER)
     local bsa   = (ru8(ADDR.PROJ_SLOT) == 0xA4)
     local bi    = (ru8(ADDR.PROJ_IMPACT) == 0x98)
@@ -240,12 +253,16 @@ local function read_game_state()
     local fkl = false
     if prev_p2_airborne and not p2air then fkl = true; boom_active = false end
     prev_p2_anim = p2an; prev_p2_airborne = p2air
+    prev_p1_airborne = p1air   -- [v1.8]
 
     return {p1_hp=p1hp,p2_hp=p2hp,p1_x=p1x,p2_x=p2x,p1_dir=p1dir,
             p1_char=p1char,p2_char=p2char,timer=timer,
             p1_stun=p1st,p2_stun=p2st,p2_stunned=(p2ss==0x24),
             p2_crouch=p2cr,p2_anim=p2an,p2_y_vel=p2yv,
-            p2_airborne=p2air,p1_airborne=false,
+            p2_airborne=p2air,
+            -- [v1.8] Blanka (P1) airborne real + landing exacto
+            p1_anim=p1an,p1_y_vel=p1yv,p1_airborne=p1air,
+            p1_landing_this_frame=p1land,
             boom_active=boom_active,boom_x_est=bxe,
             boom_incoming=bi,boom_slot_active=bsa,
             boom_throw_this_frame=boom_thr,
@@ -269,7 +286,8 @@ local function to_json(s)
         '"p1_char":%d,"p2_char":%d,"timer":%d,'..
         '"p1_stun":%d,"p2_stun":%d,"p2_stunned":%s,'..
         '"p2_crouch":%s,"p2_anim":%d,"p2_y_vel":%d,'..
-        '"p2_airborne":%s,"p1_airborne":%s,'..
+        '"p2_airborne":%s,'..
+        '"p1_anim":%d,"p1_y_vel":%d,"p1_airborne":%s,"p1_landing_this_frame":%s,'..
         '"boom_active":%s,"boom_x_est":%s,"boom_incoming":%s,'..
         '"boom_slot_active":%s,"boom_throw_this_frame":%s,'..
         '"fk_landing_this_frame":%s,"p2_hitstop":0,'..
@@ -278,7 +296,8 @@ local function to_json(s)
         s.p1_char,s.p2_char,s.timer,
         s.p1_stun,s.p2_stun,bts(s.p2_stunned),
         bts(s.p2_crouch),s.p2_anim,s.p2_y_vel,
-        bts(s.p2_airborne),bts(s.p1_airborne),
+        bts(s.p2_airborne),
+        s.p1_anim,s.p1_y_vel,bts(s.p1_airborne),bts(s.p1_landing_this_frame),
         bts(s.boom_active),float_to_json(s.boom_x_est),bts(s.boom_incoming),
         bts(s.boom_slot_active),bts(s.boom_throw_this_frame),
         bts(s.fk_landing_this_frame),
@@ -359,7 +378,10 @@ local function tick_menu(p1hp, p2hp)
         if f >= 450 then transition("WAITING_COMBAT") end
 
     elseif sm_state == "WAITING_COMBAT" then
-        if p1hp >= MIN_HP and p2hp >= MIN_HP then
+        -- [v1.10] HP válido: entre MIN_HP y 144. 255=0xFF es marcador de muerte en SF2CE.
+        local p1_valid = (p1hp >= MIN_HP and p1hp <= 144)
+        local p2_valid = (p2hp >= MIN_HP and p2hp <= 144)
+        if p1_valid and p2_valid then
             hp_stable = hp_stable + 1
             if hp_stable >= HP_STABLE_N then transition("IN_COMBAT") end
         else
@@ -380,8 +402,9 @@ local function tick_menu(p1hp, p2hp)
         if f >= 180 then transition("PRESS_CONTINUE") end
 
     elseif sm_state == "PRESS_CONTINUE" then
-        if f == 20 then hold("1 Player Start");   print("[ABridge] CONTINUE") end
-        if f == 26 then release("1 Player Start") end
+        -- [v1.9] SF2CE CONTINUE se acepta con ataque, no con Start
+        if f == 20 then hold(BTN_JAB);   print("[ABridge] CONTINUE (JAB)") end
+        if f == 26 then release(BTN_JAB) end
         if f >= 310 then transition("WAITING_COMBAT") end
     end
 end
@@ -510,7 +533,7 @@ end
 
 emu.register_frame_done(on_frame, "frame")
 
-print("[ABridge] Bridge activo v1.7")
-print("  Fixes: flush_inputs al final del frame + escritura atómica de state.txt")
+print("[ABridge] Bridge activo v1.10")
+print("  [v1.10] WAITING_COMBAT rechaza HP=255 (muerte SF2CE) + CONTINUE JAB")
 print("  -> " .. INPUT_FILE)
 print("  -> " .. STATE_FILE)

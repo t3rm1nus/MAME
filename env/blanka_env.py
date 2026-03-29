@@ -1,18 +1,38 @@
 """
 blanka_env.py — Entorno Gymnasium Blanka vs Arcade (SF2CE / MAME 0.286)
 ========================================================================
-Versión: 2.2 (29/03/2026)
+Versión: 2.5 (29/03/2026)
 
-Cambios v2.2:
-  · terminated ahora usa el campo "in_combat" del estado Lua (v1.5+).
-    Cuando Lua sale de IN_COMBAT (GAME_OVER, WIN_WAIT, etc.), el episodio
-    termina limpiamente. Esto reemplaza la detección HP<=0 que fallaba porque
-    SF2CE pone P1_HP=255 (0xFF) al morir en lugar de dejarlo en 0.
-  · bridge_error ya no devuelve truncated=True de forma inmediata. Si el
-    bridge falla consecutivamente más de _MAX_BRIDGE_ERRORS veces, entonces
-    sí trunca. Esto evita el ciclo infinito de NOOPs causado por la race
-    condition de state.txt.
-  · Añadido _bridge_error_count para diagnóstico.
+Cambios v2.5:
+  · [FIX CRÍTICO] reset() lee p1_dir del primer frame válido antes de
+    permitir que el agente actúe. Así _last_p1_dir siempre refleja el
+    lado real de Blanka al inicio del round, evitando los 20 frames de
+    RIGHT (o LEFT) incorrectos al cambiar de lado entre rounds.
+  · [FIX] _resolve() también lee p1_dir del estado actual del bridge
+    (via _last_p1_dir actualizado en el mismo frame) para el flip de
+    macros y saltos — el orden step→update ya era correcto, el problema
+    era solo el valor inicial en reset().
+Cambios v2.4 (mantenidos):
+  · [FIX] _jump_back_charge: acumula carga cuando P1 está en aire con
+    acción salto-atrás (21/22) O manteniendo ← (acción 3 si mira derecha,
+    4 si mira izquierda). Antes nunca acumulaba porque comparaba last_action
+    con la acción de dirección mientras el salto tenía su propio id.
+  · [FIX] train_blanka_v1.py contaba solo action==15 como "rolling_uses".
+    Ahora el informe también incluye acción 23 (rolling-jump). NOTA: ese
+    archivo lo modifica el usuario si quiere — aquí solo añadimos info en
+    el info dict de step() para facilitar el conteo externo.
+  · [FIX] reward acción 23 también aplica bonus si dp2>0 independiente
+    de ventana (igual que rolling normal).
+Cambios v2.3 (mantenidos):
+  · [NEW] Acción 23: MACRO_ROLLING_JUMP — Rolling Attack cargado desde salto
+    atrás. Requiere autoplay_bridge.lua v1.8 (campo p1_landing_this_frame).
+    Secuencia: cargar ← durante el salto → detectar p1_landing_this_frame
+    → ejecutar → + FIERCE en ventana de 5 frames al aterrizar.
+  · observation_space ampliado a 30 dims: añade p1_landing_this_frame (28)
+    y rolling_jump_ready (29).
+  · Reward para acción 23: igual que rolling normal pero con bonus por
+    ejecutarlo justo tras el aterrizaje.
+  · [MANTIENE] Todos los fixes de v2.2 (in_combat, bridge_error_count).
 """
 
 import os, time, sys
@@ -37,6 +57,7 @@ EPISODE_MIN_HP   = 100
 CHARGE_REQUIRED  = 15
 BOOM_FLIGHT_STEPS= 51
 FK_YVEL_THR      = 256
+LANDING_WINDOW   = 8    # frames de ventana tras p1_landing_this_frame para ejecutar rolling
 
 # Número de fallos consecutivos de bridge.step() antes de truncar el episodio.
 # Con reintentos en mame_bridge.py el número de fallos reales debería ser << 10.
@@ -74,15 +95,25 @@ SINGLE_FRAME_ACTIONS: List[List[int]] = [
     # Salto atrás + ataque — escape + contraataque
     [1,0,1,0,0,0,1,0,0,0,0,0],  # 21  UP+LEFT+FIERCE   (salto atrás + puño fuerte)
     [1,0,1,0,0,0,0,0,0,1,0,0],  # 22  UP+LEFT+FORWARD  (salto atrás + patada media)
+    # 23=MACRO_ROLLING_JUMP (ver MACROS dict)
 ]
 MACRO_ROLLING: List[List[int]] = (
     [[0,0,1,0,0,0,0,0,0,0,0,0]] * 21 +
     [[0,0,0,1,1,0,0,0,0,0,0,0]]
 )
 MACRO_ELECTRIC: List[List[int]] = [[0,0,0,0,1,0,0,0,0,0,0,0]] * 5
-MACROS: Dict[int, List[List[int]]] = {15: MACRO_ROLLING, 16: MACRO_ELECTRIC}
+# Acción 23: Rolling cargado desde salto atrás.
+# La macro SOLO envía el input final (→ + FIERCE). El timing del aterrizaje
+# lo controla Python en _resolve() usando el campo p1_landing_this_frame del estado.
+# La macro tiene 1 frame de → seguido del input de rolling (← 21f + → + JAB)
+# para que el motor de carga del juego lo registre correctamente.
+MACRO_ROLLING_JUMP: List[List[int]] = (
+    [[0,0,0,1,0,0,0,0,0,0,0,0]] * 1 +   # → suelto (rompe carga)
+    [[0,0,0,0,0,0,1,0,0,0,0,0]]           # FIERCE (rolling attack)
+)
+MACROS: Dict[int, List[List[int]]] = {15: MACRO_ROLLING, 16: MACRO_ELECTRIC, 23: MACRO_ROLLING_JUMP}
 NOOP = SINGLE_FRAME_ACTIONS[0]
-N_ACTIONS = 23  # total acciones (0-14 single, 15-16 macros, 17-22 saltos)
+N_ACTIONS = 24  # total acciones (0-14 single, 15-16 macros, 17-22 saltos, 23 rolling-jump)
 
 
 def fk_phase_value(anim: int, p2_airborne: bool) -> float:
@@ -96,9 +127,9 @@ def fk_phase_value(anim: int, p2_airborne: bool) -> float:
 
 class BlankaEnv(gym.Env):
     """
-    observation_space: Box(28,) float32
-    action_space:      Discrete(23)  # 0-14 single, 15-16 macros, 17-22 saltos+ataque
-      15 = Rolling Attack macro | 16 = Electric Thunder macro
+    observation_space: Box(30,) float32
+    action_space:      Discrete(24)  # 0-14 single, 15-16 macros, 17-22 saltos+ataque, 23 rolling-jump
+      15 = Rolling Attack macro | 16 = Electric Thunder macro | 23 = Rolling desde salto atrás
     """
     metadata = {"render_modes": ["human"]}
 
@@ -111,7 +142,7 @@ class BlankaEnv(gym.Env):
         self.registry    = registry
         self.bridge      = MAMEBridge(instance_id=instance_id)
 
-        self.observation_space = spaces.Box(-1.0, 1.0, shape=(28,), dtype=np.float32)
+        self.observation_space = spaces.Box(-1.0, 1.0, shape=(30,), dtype=np.float32)
         self.action_space      = spaces.Discrete(N_ACTIONS)
 
         self._prev_p1_hp    = MAX_HP
@@ -137,6 +168,11 @@ class BlankaEnv(gym.Env):
         self._MAX_SF        = 3
         # [FIX v2.2] Contador de fallos consecutivos de bridge
         self._bridge_error_count = 0
+        # [v2.3] Estado para Rolling cargado desde salto atrás (acción 23)
+        self._p1_was_air       = False   # tracking airborne de P1
+        self._p1_land_steps    = 0       # frames desde que P1 aterrizó (0=en tierra/no relevante)
+        self._jump_back_charge = 0       # frames con ← mantenido DURANTE el salto atrás
+        self._rolling_jump_rdy = False   # True cuando hay carga suficiente y acaba de aterrizar
 
     # ── OBSERVACIÓN ──────────────────────────────────────────────────────────
     def _get_obs(self, st: Optional[Dict]) -> np.ndarray:
@@ -165,6 +201,8 @@ class BlankaEnv(gym.Env):
         d2 = max(0.0, max(self._p2_hp_hist) - p2hp) / MAX_HP if self._p2_hp_hist else 0.0
 
         p2cr  = bool(st.get("p2_crouch", False))
+
+        p1land = bool(st.get("p1_landing_this_frame", False)) if st else False
 
         obs = np.array([
             p1hp / MAX_HP,                       # 0
@@ -195,6 +233,9 @@ class BlankaEnv(gym.Env):
             float(p2his > 0),                    # 25
             float(self._fk_land_steps > 0 and self._fk_land_steps <= 20),  # 26
             self._last_action / float(N_ACTIONS - 1),            # 27
+            # [v2.3] Rolling desde salto atrás
+            float(p1land or (self._p1_land_steps > 0 and self._p1_land_steps <= LANDING_WINDOW)),  # 28
+            float(self._rolling_jump_rdy),       # 29
         ], dtype=np.float32)
         return np.clip(obs, -1.0, 1.0)
 
@@ -238,6 +279,15 @@ class BlankaEnv(gym.Env):
         if self._ep_step > 50 and dp2 == 0 and dp1 == 0: r -= 0.002
         if p2x < 100 or p2x > 1300: r += 1.0
 
+        # Acción 23: Rolling desde salto atrás — recompensa por timing perfecto
+        if action == 23:
+            in_window = self._p1_land_steps > 0 and self._p1_land_steps <= LANDING_WINDOW
+            had_charge = self._jump_back_charge >= CHARGE_REQUIRED
+            if in_window and dp2 > 0:         r += 22.0  # perfecto: timing + carga + daño
+            elif in_window and had_charge:     r += 6.0   # timing correcto, carga ok, no golpeó
+            elif dp2 > 0:                      r += 8.0   # golpeó (rolling normal sin jump)
+            else:                              r -= 3.0   # ni timing ni daño
+
         # Recompensas para saltos con ataque (acciones 17-22)
         JUMP_ATTACKS = (17, 18, 19, 20, 21, 22)
         if action in JUMP_ATTACKS:
@@ -268,9 +318,19 @@ class BlankaEnv(gym.Env):
         if self._macro_buf > 0:
             self._macro_buf = 0; return NOOP
         if action in MACROS:
-            seq = list(MACROS[action])
-            if action == 15 and self._last_p1_dir == 0:
-                seq = [[f[0],f[1],f[3],f[2]]+f[4:] for f in seq]
+            # Acción 23: solo ejecutar si estamos en la ventana de aterrizaje
+            if action == 23:
+                in_window = self._p1_land_steps > 0 and self._p1_land_steps <= LANDING_WINDOW
+                if not in_window:
+                    return NOOP   # fuera de ventana → NOOP silencioso
+                # Flip si Blanka mira izquierda (→ es la dirección contraria)
+                seq = list(MACROS[23])
+                if self._last_p1_dir == 0:
+                    seq = [[f[0],f[1],f[3],f[2]]+f[4:] for f in seq]
+            else:
+                seq = list(MACROS[action])
+                if action == 15 and self._last_p1_dir == 0:
+                    seq = [[f[0],f[1],f[3],f[2]]+f[4:] for f in seq]
             self._macro_active = True; self._macro_seq = seq
             self._macro_buf = len(seq); return self._macro_seq.pop(0)
         if action < len(SINGLE_FRAME_ACTIONS):
@@ -283,7 +343,7 @@ class BlankaEnv(gym.Env):
         return NOOP
 
     def _update_charge(self, action: int):
-        if action == 15: self._charge = 0; return
+        if action in (15, 23): self._charge = 0; return
         back = 3 if self._last_p1_dir == 1 else 4
         self._charge = min(self._charge + 1, CHARGE_REQUIRED) if action == back else 0
 
@@ -292,6 +352,40 @@ class BlankaEnv(gym.Env):
         proj = bool(st.get("boom_slot_active", False))
         p2x  = float(st.get("p2_x", 700.0))
         cid  = int(st.get("p2_char", 0xFF))
+        # [v2.3] Tracking P1 (Blanka) para rolling desde salto atrás
+        p1a  = bool(st.get("p1_airborne", False))
+        p1land_frame = bool(st.get("p1_landing_this_frame", False))
+        # [FIX v2.4] "atrás" durante el salto:
+        # · acciones 21/22 = salto atrás (UP+LEFT o UP+LEFT+ataque) → siempre carga
+        # · acción 3 (LEFT) si mira derecha, acción 4 (RIGHT) si mira izquierda → dirección atrás pura
+        # · cualquier acción de salto-atrás con ataque (21,22) también cuenta
+        back_jump = self._last_action in (21, 22)   # salto atrás explícito
+        back_dir  = (self._last_action == 3 and self._last_p1_dir == 1) or                     (self._last_action == 4 and self._last_p1_dir == 0)
+        back_held = back_jump or back_dir
+        if p1a:
+            if back_held:
+                self._jump_back_charge = min(self._jump_back_charge + 1, CHARGE_REQUIRED + 10)
+            # En el aire sin mantener atrás NO reseteamos — puede soltar un frame y volver
+        else:
+            if p1land_frame:
+                # Al aterrizar: mantener la carga acumulada para poder usarla
+                pass   # no resetear — la carga se usa o decae con el tiempo
+            elif not self._p1_was_air:
+                # Lleva varios frames en tierra sin haber aterrizado ahora → decaer
+                self._jump_back_charge = max(0, self._jump_back_charge - 1)
+        if p1land_frame:
+            self._p1_land_steps = 1
+        elif self._p1_land_steps > 0:
+            self._p1_land_steps += 1
+            if self._p1_land_steps > LANDING_WINDOW + 5:
+                self._p1_land_steps = 0
+        self._p1_was_air = p1a
+        # rolling_jump_rdy: tuvo carga en el salto Y está en ventana de aterrizaje
+        self._rolling_jump_rdy = (
+            self._jump_back_charge >= CHARGE_REQUIRED and
+            self._p1_land_steps > 0 and
+            self._p1_land_steps <= LANDING_WINDOW
+        )
 
         if proj and self._boom_timer >= BOOM_FLIGHT_STEPS:
             self._boom_timer = 0
@@ -322,6 +416,9 @@ class BlankaEnv(gym.Env):
         self._ep_p1_dmg = 0.0; self._ep_p2_dmg = 0.0
         self._p1_hp_hist.clear(); self._p2_hp_hist.clear()
         self._bridge_error_count = 0
+        # [v2.3] reset rolling-jump state
+        self._p1_was_air = False; self._p1_land_steps = 0
+        self._jump_back_charge = 0; self._rolling_jump_rdy = False
 
         print(f"[BlankaEnv#{self.instance_id}] Reset...")
 
@@ -349,14 +446,18 @@ class BlankaEnv(gym.Env):
             time.sleep(0.05)
 
         if st is None:
-            return np.zeros(28, dtype=np.float32), {}
+            return np.zeros(30, dtype=np.float32), {}
 
         p1  = st.get("p1_hp", 0); p2 = st.get("p2_hp", 0)
         cid = st.get("p2_char", 0xFF)
-        print(f"[BlankaEnv#{self.instance_id}] vs {CHAR_NAMES.get(cid,'?')} | P1={p1} P2={p2}")
+        # [FIX v2.5] Leer p1_dir real desde el primer frame del nuevo round.
+        # Sin esto, _last_p1_dir=1 (default de reset) pero Blanka puede empezar
+        # mirando izquierda (p1_dir=0), causando 20+ frames de dirección incorrecta.
+        self._last_p1_dir = int(st.get("p1_dir", 1))
+        print(f"[BlankaEnv#{self.instance_id}] vs {CHAR_NAMES.get(cid,'?')} | P1={p1} P2={p2} dir={'→' if self._last_p1_dir==1 else '←'}")
         self._prev_p1_hp = float(p1); self._prev_p2_hp = float(p2)
         self._current_rival = cid if cid <= 11 else 0xFF
-        return self._get_obs(st), {"p1_hp": p1, "p2_hp": p2, "rival": cid}
+        return self._get_obs(st), {"p1_hp": p1, "p2_hp": p2, "rival": cid, "p1_dir": self._last_p1_dir}
 
     # ── STEP ─────────────────────────────────────────────────────────────────
     def step(self, action: int):
@@ -409,6 +510,10 @@ class BlankaEnv(gym.Env):
             "action": action, "rival": self._current_rival,
             "boom_t": self._boom_timer, "fk_land": self._fk_land_steps,
             "charge": self._charge,
+            # [v2.4] para conteo externo en train_blanka
+            "rolling_jump": int(action == 23),
+            "p1_land": self._p1_land_steps,
+            "rolling_jump_rdy": int(self._rolling_jump_rdy),
         }
 
     def render(self): pass

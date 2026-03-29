@@ -3,3 +3,5 @@ __pycache__
 /legacy/venv_tb
 /legacy/models
 venv310
+EMULADOR/mame.exe
+EMULADOR/mame.sym
