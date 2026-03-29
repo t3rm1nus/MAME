@@ -1,26 +1,29 @@
 -- =============================================================================
--- autoplay_bridge.lua  |  v1.10 |  SF2CE / MAME 0.286  |  29/03/2026
+-- autoplay_bridge.lua  |  v1.13 |  SF2CE / MAME 0.286  |  29/03/2026
 -- =============================================================================
--- CAMBIOS v1.10 (sobre v1.9):
---   · [FIX CRÍTICO] WAITING_COMBAT: P1_HP=255 (0xFF) es el valor de muerte
---     en SF2CE, NO vida completa. Añadido tope superior: p1hp <= 144 y
---     p2hp <= 144. Sin este fix el bridge entraba en combate con Blanka
---     muerta, causando el episodio de 155 frames inmediato.
---   · [FIX] WAITING_COMBAT ahora exige que AMBOS HP sean válidos (1-144)
---     para transicionar a IN_COMBAT.
--- CAMBIOS v1.9 (mantenidos):
---   · [FIX] PRESS_CONTINUE usa BTN_JAB en lugar de "1 Player Start".
---     SF2CE acepta cualquier botón de ataque en la pantalla de CONTINUE.
--- CAMBIOS v1.8 (mantenidos):
---   · [NEW] Detección real de p1_airborne/p1_anim/p1_y_vel (antes siempre false).
---     Bloque estado P1 en 0xFF8300 (mismo esquema de offsets que P2 en 0xFF8600).
---   · [NEW] Campo p1_landing_this_frame: true exactamente el frame en que
---     Blanka aterriza. Permite ejecutar Rolling cargado desde salto atrás
---     con timing perfecto desde Python (acción 23 en blanka_env.py).
---   · [MANTIENE] Todos los fixes de v1.7 (flush al final, escritura atómica).
+-- CAMBIOS v1.13 (sobre v1.12):
+--   · [FIX CRÍTICO] Eliminada toda detección de timeout basada en timer RAM.
+--     La dirección 0xFF8ACE siempre devuelve 0 → falsos positivos en mitad
+--     del combate. Reemplazado por contador de frames interno:
+--       MAX_COMBAT_FRAMES = 6400 (> 99s × 60fps = 5940f, con margen del 7%)
+--     Cuando diag_combat_frame >= MAX_COMBAT_FRAMES → timeout real por tiempo.
+--   · [DIAG] El campo "timer" en state.txt ahora exporta un timer estimado
+--     calculado como max(0, ceil((MAX_COMBAT_FRAMES - diag_combat_frame) / 60))
+--     para que blanka_env.py tenga un timer útil aunque la RAM sea basura.
+--   · [DIAG] Log del valor raw de 0xFF8ACE mantenido como "timer_raw" para
+--     poder confirmar o descartar la dirección en el futuro.
+-- CAMBIOS v1.12 (descartados):
+--   · timer_zero_frames y timer_ever_valid eliminados (atacaban el síntoma,
+--     no la causa raíz).
+-- CAMBIOS v1.11 (mantenidos):
+--   · ROUND_OVER_WAIT distingue ronda vs game over real por HP.
+--   · Double KO → ROUND_OVER_WAIT.
+--   · hp_stable >= 10 frames consecutivos anti-falso-positivo.
+-- CAMBIOS v1.10 (mantenidos):
+--   · WAITING_COMBAT rechaza HP=255 — tope MAX_HP_VALID=144.
 -- =============================================================================
 
-local BRIDGE_VERSION = "autoplay_bridge_v1.10"
+local BRIDGE_VERSION = "autoplay_bridge_v1.13"
 local BASE_DIR       = "C:\\proyectos\\MAME\\"
 local INPUT_FILE     = BASE_DIR .. "mame_input.txt"
 local STATE_FILE     = BASE_DIR .. "state.txt"
@@ -45,15 +48,17 @@ local ADDR = {
     P1_STUN=0xFF895A, P2_STUN=0xFF865A, P2_STUN_SPRITE=0xFF8951,
     P2_CROUCH=0xFF86C4, P2_ANIM=0xFF86C1,
     P2_Y_VEL_H=0xFF86FC, P2_Y_VEL_L=0xFF86FD,
-    -- [v1.8] P1 (Blanka) — bloque estado 0xFF8300, mismo esquema de offsets que P2
-    P1_ANIM=0xFF83C1,    -- +0xC1 como P2_ANIM    (0xFF86C1)
-    P1_Y_VEL_H=0xFF83FC, -- +0xFC como P2_Y_VEL_H (0xFF86FC)
-    P1_Y_VEL_L=0xFF83FD, -- +0xFD como P2_Y_VEL_L (0xFF86FD)
+    P1_ANIM=0xFF83C1,
+    P1_Y_VEL_H=0xFF83FC,
+    P1_Y_VEL_L=0xFF83FD,
     PROJ_SLOT=0xFF8E30, PROJ_IMPACT=0xFF8E00,
-    TIMER=0xFF8ACE,
+    TIMER=0xFF8ACE,  -- ⚠️ v1.13: dirección NO FIABLE (siempre 0). Solo diagnóstico.
 }
 
--- ── NOMBRES DE BOTONES REALES EN SF2CE/MAME ──────────────────────────────────
+-- [v1.13] Timeout por frames internos — 99s × 60fps = 5940f + 7% margen = 6400.
+local MAX_COMBAT_FRAMES = 6400
+
+-- ── NOMBRES DE BOTONES ────────────────────────────────────────────────────────
 local BTN_JAB        = "P1 Jab Punch"
 local BTN_STRONG     = "P1 Strong Punch"
 local BTN_FIERCE     = "P1 Fierce Punch"
@@ -103,7 +108,6 @@ local function try_init()
                     total = total + 1
                 end
             end
-
             if total > 0 then
                 local found = 0
                 for _, name in ipairs(BUTTON_NAMES) do
@@ -115,8 +119,7 @@ local function try_init()
                         print("  [???] " .. name .. " <- NO ENCONTRADO")
                     end
                 end
-                print(string.format(
-                    "[ABridge] Campos: %d/%d (de %d totales — DIPs excluidos)",
+                print(string.format("[ABridge] Campos: %d/%d (de %d totales)",
                     found, #BUTTON_NAMES, total))
                 _fields_ok = (found >= 10)
             end
@@ -127,12 +130,10 @@ end
 
 -- ── SISTEMA DE INPUTS ─────────────────────────────────────────────────────────
 local _held = {}
-
 local function hold(name)    _held[name] = true end
 local function release(name) _held[name] = nil  end
 local function clear_held()  _held = {}          end
 
--- [FIX v1.7] flush_inputs se llama al FINAL del frame, después de hold()/clear_held()
 local function flush_inputs()
     if not _fields_ok then return end
     for name, field in pairs(_fields) do
@@ -163,13 +164,13 @@ local boom_active      = false
 local boom_throw_frame = -1
 local prev_p2_anim     = 0
 local prev_p2_airborne = false
-local prev_p1_airborne = false   -- [v1.8] tracking airborne Blanka (P1)
+local prev_p1_airborne = false
 local BOOM_VEL         = 25
 local MIN_HP           = 100
+local MAX_HP_VALID     = 144
 local hp_stable        = 0
 local HP_STABLE_N      = 10
 
--- ── DIAGNÓSTICO ───────────────────────────────────────────────────────────────
 local diag_noop_count    = 0
 local diag_action_count  = 0
 local diag_combat_frame  = 0
@@ -204,9 +205,9 @@ end
 local function read_game_state()
     if not _mem_ok then
         return {p1_hp=0,p2_hp=0,p1_x=700,p2_x=700,p1_dir=1,
-                p1_char=0,p2_char=0,timer=99,p1_stun=0,p2_stun=0,
-                p2_stunned=false,p2_crouch=false,p2_anim=0,p2_y_vel=0,
-                p2_airborne=false,
+                p1_char=0,p2_char=0,timer=99,timer_raw=0,
+                p1_stun=0,p2_stun=0,p2_stunned=false,
+                p2_crouch=false,p2_anim=0,p2_y_vel=0,p2_airborne=false,
                 p1_anim=0,p1_y_vel=0,p1_airborne=false,p1_landing_this_frame=false,
                 boom_active=false,boom_x_est=0.0,boom_incoming=false,
                 boom_slot_active=false,boom_throw_this_frame=false,
@@ -224,12 +225,17 @@ local function read_game_state()
     local p2an  = ru8(ADDR.P2_ANIM)
     local p2yv  = rs16(ADDR.P2_Y_VEL_H, ADDR.P2_Y_VEL_L)
     local p2air = (math.abs(p2yv) > 256)
-    -- [v1.8] P1 (Blanka) airborne detection — mismo método que P2
     local p1an  = ru8(ADDR.P1_ANIM)
     local p1yv  = rs16(ADDR.P1_Y_VEL_H, ADDR.P1_Y_VEL_L)
     local p1air = (math.abs(p1yv) > 256)
-    local p1land= prev_p1_airborne and not p1air   -- true SOLO el frame de aterrizaje
-    local timer = ru8(ADDR.TIMER)
+    local p1land= prev_p1_airborne and not p1air
+
+    -- [v1.13] timer_raw = valor crudo de RAM (solo para diagnóstico en logs).
+    -- timer     = estimado por frames internos — usado por blanka_env.py.
+    local timer_raw = ru8(ADDR.TIMER)
+    local frames_remaining = math.max(0, MAX_COMBAT_FRAMES - diag_combat_frame)
+    local timer_est = math.min(99, math.ceil(frames_remaining / 60))
+
     local bsa   = (ru8(ADDR.PROJ_SLOT) == 0xA4)
     local bi    = (ru8(ADDR.PROJ_IMPACT) == 0x98)
 
@@ -252,29 +258,24 @@ local function read_game_state()
 
     local fkl = false
     if prev_p2_airborne and not p2air then fkl = true; boom_active = false end
-    prev_p2_anim = p2an; prev_p2_airborne = p2air
-    prev_p1_airborne = p1air   -- [v1.8]
+    prev_p2_anim = p2an; prev_p2_airborne = p2air; prev_p1_airborne = p1air
 
-    return {p1_hp=p1hp,p2_hp=p2hp,p1_x=p1x,p2_x=p2x,p1_dir=p1dir,
-            p1_char=p1char,p2_char=p2char,timer=timer,
-            p1_stun=p1st,p2_stun=p2st,p2_stunned=(p2ss==0x24),
-            p2_crouch=p2cr,p2_anim=p2an,p2_y_vel=p2yv,
-            p2_airborne=p2air,
-            -- [v1.8] Blanka (P1) airborne real + landing exacto
-            p1_anim=p1an,p1_y_vel=p1yv,p1_airborne=p1air,
+    return {p1_hp=p1hp, p2_hp=p2hp, p1_x=p1x, p2_x=p2x, p1_dir=p1dir,
+            p1_char=p1char, p2_char=p2char,
+            timer=timer_est,       -- [v1.13] estimado por frames
+            timer_raw=timer_raw,   -- [v1.13] RAM cruda (diagnóstico)
+            p1_stun=p1st, p2_stun=p2st, p2_stunned=(p2ss==0x24),
+            p2_crouch=p2cr, p2_anim=p2an, p2_y_vel=p2yv, p2_airborne=p2air,
+            p1_anim=p1an, p1_y_vel=p1yv, p1_airborne=p1air,
             p1_landing_this_frame=p1land,
-            boom_active=boom_active,boom_x_est=bxe,
-            boom_incoming=bi,boom_slot_active=bsa,
+            boom_active=boom_active, boom_x_est=bxe,
+            boom_incoming=bi, boom_slot_active=bsa,
             boom_throw_this_frame=boom_thr,
-            fk_landing_this_frame=fkl,frame=frame_count}
+            fk_landing_this_frame=fkl, frame=frame_count}
 end
 
 -- ── SERIALIZACIÓN JSON ────────────────────────────────────────────────────────
--- [FIX v1.7 locale] boom_x_est usa tostring() + gsub para garantizar punto
--- decimal independientemente del locale del sistema (es_ES usa coma).
--- string.format("%.1f", 0.0) puede producir "0,0" en Windows con locale español.
 local function float_to_json(v)
-    -- math.floor distingue enteros de decimales
     local i = math.floor(v)
     local d = math.floor((v - i) * 10 + 0.5)
     return string.format("%d.%d", i, d)
@@ -283,7 +284,7 @@ end
 local function to_json(s)
     return string.format(
         '{"p1_hp":%d,"p2_hp":%d,"p1_x":%d,"p2_x":%d,"p1_dir":%d,'..
-        '"p1_char":%d,"p2_char":%d,"timer":%d,'..
+        '"p1_char":%d,"p2_char":%d,"timer":%d,"timer_raw":%d,'..
         '"p1_stun":%d,"p2_stun":%d,"p2_stunned":%s,'..
         '"p2_crouch":%s,"p2_anim":%d,"p2_y_vel":%d,'..
         '"p2_airborne":%s,'..
@@ -292,57 +293,41 @@ local function to_json(s)
         '"boom_slot_active":%s,"boom_throw_this_frame":%s,'..
         '"fk_landing_this_frame":%s,"p2_hitstop":0,'..
         '"in_combat":%s,"frame":%d}',
-        s.p1_hp,s.p2_hp,s.p1_x,s.p2_x,s.p1_dir,
-        s.p1_char,s.p2_char,s.timer,
-        s.p1_stun,s.p2_stun,bts(s.p2_stunned),
-        bts(s.p2_crouch),s.p2_anim,s.p2_y_vel,
+        s.p1_hp, s.p2_hp, s.p1_x, s.p2_x, s.p1_dir,
+        s.p1_char, s.p2_char, s.timer, s.timer_raw,
+        s.p1_stun, s.p2_stun, bts(s.p2_stunned),
+        bts(s.p2_crouch), s.p2_anim, s.p2_y_vel,
         bts(s.p2_airborne),
-        s.p1_anim,s.p1_y_vel,bts(s.p1_airborne),bts(s.p1_landing_this_frame),
-        bts(s.boom_active),float_to_json(s.boom_x_est),bts(s.boom_incoming),
-        bts(s.boom_slot_active),bts(s.boom_throw_this_frame),
+        s.p1_anim, s.p1_y_vel, bts(s.p1_airborne), bts(s.p1_landing_this_frame),
+        bts(s.boom_active), float_to_json(s.boom_x_est), bts(s.boom_incoming),
+        bts(s.boom_slot_active), bts(s.boom_throw_this_frame),
         bts(s.fk_landing_this_frame),
         bts(sm_state == "IN_COMBAT"),
         s.frame)
 end
 
--- [FIX v1.7] Escritura atómica: escribe en .tmp y renombra a .txt
--- Esto elimina la ventana de tiempo donde state.txt está vacío (truncado
--- por "w" pero aún no escrito). Python nunca verá un archivo vacío.
 local function write_state(s)
     local json_str = to_json(s) .. "\n"
-
-    -- Intentar escritura atómica (tmp → rename)
     local f = io.open(STATE_TMP, "w")
     if f then
-        f:write(json_str)
-        f:flush()   -- garantiza que los bytes están en disco antes de renombrar
-        f:close()
+        f:write(json_str); f:flush(); f:close()
         local ok = os.rename(STATE_TMP, STATE_FILE)
-        if ok then
-            diag_write_ok = diag_write_ok + 1
-            return
-        end
-        -- Si rename falla (Windows: archivo destino abierto), caemos al fallback
+        if ok then diag_write_ok = diag_write_ok + 1; return end
     end
-
-    -- Fallback: escritura directa con flush explícito
     local f2 = io.open(STATE_FILE, "w")
     if f2 then
-        f2:write(json_str)
-        f2:flush()
-        f2:close()
+        f2:write(json_str); f2:flush(); f2:close()
         diag_write_ok = diag_write_ok + 1
     else
         diag_write_fail = diag_write_fail + 1
         if diag_write_fail % 60 == 1 then
-            print(string.format("[ABridge] ERROR: no se puede escribir state.txt (fail=%d)",
-                diag_write_fail))
+            print(string.format("[ABridge] ERROR write state.txt (fail=%d)", diag_write_fail))
         end
     end
 end
 
 -- ── MÁQUINA DE ESTADOS ────────────────────────────────────────────────────────
-local function tick_menu(p1hp, p2hp)
+local function tick_menu(p1hp, p2hp, timer_raw)
     state_frame = state_frame + 1
     local f = state_frame
 
@@ -351,36 +336,35 @@ local function tick_menu(p1hp, p2hp)
 
     elseif sm_state == "DISMISS_WARNING" then
         clear_held()
-        if f % 30 >= 1  and f % 30 <= 5  then hold(BTN_JAB)            end
-        if f % 30 >= 15 and f % 30 <= 19 then hold("1 Player Start")   end
+        if f % 30 >= 1  and f % 30 <= 5  then hold(BTN_JAB)           end
+        if f % 30 >= 15 and f % 30 <= 19 then hold("1 Player Start")  end
         if f >= 180 then clear_held(); transition("INSERT_COIN") end
 
     elseif sm_state == "INSERT_COIN" then
-        if f == 20 then hold("Coin 1");     print("[ABridge] Pulsando Coin 1")       end
-        if f == 26 then release("Coin 1");  print("[ABridge] Soltando Coin 1")       end
+        if f == 20 then hold("Coin 1");    print("[ABridge] Pulsando Coin 1")   end
+        if f == 26 then release("Coin 1"); print("[ABridge] Soltando Coin 1")   end
         if f >= 100 then transition("PRESS_START") end
 
     elseif sm_state == "PRESS_START" then
-        if f == 20 then hold("1 Player Start");     print("[ABridge] Pulsando 1 Player Start") end
-        if f == 26 then release("1 Player Start");  print("[ABridge] Soltando 1 Player Start") end
+        if f == 20 then hold("1 Player Start");    print("[ABridge] Pulsando 1 Player Start") end
+        if f == 26 then release("1 Player Start"); print("[ABridge] Soltando 1 Player Start") end
         if f >= 220 then transition("CHAR_NAVIGATE") end
 
     elseif sm_state == "CHAR_NAVIGATE" then
-        if f == 10 then hold("P1 Right");    print("[ABridge] RIGHT 1") end
+        if f == 10 then hold("P1 Right");   print("[ABridge] RIGHT 1") end
         if f == 16 then release("P1 Right") end
-        if f == 40 then hold("P1 Right");    print("[ABridge] RIGHT 2") end
+        if f == 40 then hold("P1 Right");   print("[ABridge] RIGHT 2") end
         if f == 46 then release("P1 Right") end
         if f >= 90 then transition("CHAR_CONFIRM") end
 
     elseif sm_state == "CHAR_CONFIRM" then
-        if f == 10 then hold(BTN_JAB);     print("[ABridge] JAB confirm (Blanka)") end
+        if f == 10 then hold(BTN_JAB);    print("[ABridge] JAB confirm (Blanka)") end
         if f == 16 then release(BTN_JAB) end
         if f >= 450 then transition("WAITING_COMBAT") end
 
     elseif sm_state == "WAITING_COMBAT" then
-        -- [v1.10] HP válido: entre MIN_HP y 144. 255=0xFF es marcador de muerte en SF2CE.
-        local p1_valid = (p1hp >= MIN_HP and p1hp <= 144)
-        local p2_valid = (p2hp >= MIN_HP and p2hp <= 144)
+        local p1_valid = (p1hp >= MIN_HP and p1hp <= MAX_HP_VALID)
+        local p2_valid = (p2hp >= MIN_HP and p2hp <= MAX_HP_VALID)
         if p1_valid and p2_valid then
             hp_stable = hp_stable + 1
             if hp_stable >= HP_STABLE_N then transition("IN_COMBAT") end
@@ -392,17 +376,33 @@ local function tick_menu(p1hp, p2hp)
             transition("DISMISS_WARNING")
         end
 
-    elseif sm_state == "WIN_WAIT" then
-        if f >= 300 then transition("WAITING_COMBAT") end
+    elseif sm_state == "ROUND_OVER_WAIT" then
+        local p1_valid = (p1hp >= MIN_HP and p1hp <= MAX_HP_VALID)
+        local p2_valid = (p2hp >= MIN_HP and p2hp <= MAX_HP_VALID)
+        if p1_valid and p2_valid then
+            hp_stable = hp_stable + 1
+            if hp_stable >= HP_STABLE_N then
+                print(string.format(
+                    "[F%d] ROUND_OVER_WAIT: HP restaurados (P1=%d P2=%d) → siguiente ronda",
+                    frame_count, p1hp, p2hp))
+                transition("WAITING_COMBAT")
+            end
+        else
+            hp_stable = 0
+        end
+        if f >= 360 then
+            print(string.format(
+                "[F%d] ROUND_OVER_WAIT timeout: HP no restaurados → GAME OVER real",
+                frame_count))
+            transition("GAME_OVER_WAIT")
+        end
 
     elseif sm_state == "GAME_OVER_WAIT" then
-        -- Insertar moneda durante la espera para que el CONTINUE funcione
-        if f == 60 then hold("Coin 1");   print("[ABridge] Coin antes de CONTINUE") end
-        if f == 66 then release("Coin 1") end
+        if f == 60  then hold("Coin 1");   print("[ABridge] Coin antes de CONTINUE") end
+        if f == 66  then release("Coin 1") end
         if f >= 180 then transition("PRESS_CONTINUE") end
 
     elseif sm_state == "PRESS_CONTINUE" then
-        -- [v1.9] SF2CE CONTINUE se acepta con ataque, no con Start
         if f == 20 then hold(BTN_JAB);   print("[ABridge] CONTINUE (JAB)") end
         if f == 26 then release(BTN_JAB) end
         if f >= 310 then transition("WAITING_COMBAT") end
@@ -419,26 +419,19 @@ local function on_frame()
                 frame_count, tostring(_mem_ok), tostring(_fields_ok)))
         end
         write_state(read_game_state())
-        -- [FIX v1.7] flush incluso durante init (sin inputs = todo a 0)
         flush_inputs()
         return
     end
 
-    -- 1. Leer estado del juego
     local st = read_game_state()
-
-    -- 2. Escribir state.txt para Python (ANTES de aplicar inputs)
     write_state(st)
 
-    -- 3. Lógica de estado
     if sm_state == "IN_COMBAT" then
         diag_combat_frame = diag_combat_frame + 1
 
-        -- Leer input de Python
         local buttons = read_python_input()
         if buttons then
             last_input = buttons
-
             local any_active = false
             local active_names = {}
             for i = 1, 10 do
@@ -459,46 +452,65 @@ local function on_frame()
             end
         end
 
-        -- Diagnóstico periódico de inputs
         if diag_combat_frame % 600 == 0 then
             local total = diag_noop_count + diag_action_count
             local pct   = total > 0 and (diag_action_count * 100 / total) or 0
             print(string.format(
-                "[DIAG] F%d | Combate f=%d | NOOPs=%d Acciones=%d (%.1f%%) | Write OK=%d FAIL=%d",
-                frame_count, diag_combat_frame,
+                "[DIAG] F%d | cf=%d/%d | NOOPs=%d Acc=%d (%.1f%%) | W_OK=%d W_FAIL=%d",
+                frame_count, diag_combat_frame, MAX_COMBAT_FRAMES,
                 diag_noop_count, diag_action_count, pct,
                 diag_write_ok, diag_write_fail))
         end
 
-        -- [FIX v1.7] Aplicar inputs: clear → hold → flush (en este orden)
         clear_held()
         local b = last_input
-        if (b[1]  or 0)~=0 then hold("P1 Up")         end
-        if (b[2]  or 0)~=0 then hold("P1 Down")        end
-        if (b[3]  or 0)~=0 then hold("P1 Left")        end
-        if (b[4]  or 0)~=0 then hold("P1 Right")       end
-        if (b[5]  or 0)~=0 then hold(BTN_JAB)          end
-        if (b[6]  or 0)~=0 then hold(BTN_STRONG)       end
-        if (b[7]  or 0)~=0 then hold(BTN_FIERCE)       end
-        if (b[8]  or 0)~=0 then hold(BTN_SHORT)        end
-        if (b[9]  or 0)~=0 then hold(BTN_FORWARD)      end
-        if (b[10] or 0)~=0 then hold(BTN_ROUNDHOUSE)   end
+        if (b[1]  or 0)~=0 then hold("P1 Up")       end
+        if (b[2]  or 0)~=0 then hold("P1 Down")      end
+        if (b[3]  or 0)~=0 then hold("P1 Left")      end
+        if (b[4]  or 0)~=0 then hold("P1 Right")     end
+        if (b[5]  or 0)~=0 then hold(BTN_JAB)        end
+        if (b[6]  or 0)~=0 then hold(BTN_STRONG)     end
+        if (b[7]  or 0)~=0 then hold(BTN_FIERCE)     end
+        if (b[8]  or 0)~=0 then hold(BTN_SHORT)      end
+        if (b[9]  or 0)~=0 then hold(BTN_FORWARD)    end
+        if (b[10] or 0)~=0 then hold(BTN_ROUNDHOUSE) end
 
-        -- Detección fin de ronda
-        if st.p2_hp <= 0 and st.p1_hp > 0 then
+        -- ── DETECCIÓN FIN DE RONDA ───────────────────────────────────────────
+        local p1_dead = (st.p1_hp <= 0)
+        local p2_dead = (st.p2_hp <= 0)
+
+        -- [v1.13] Timeout SOLO por frames internos. NO se lee la RAM del timer.
+        local timeout = (diag_combat_frame >= MAX_COMBAT_FRAMES)
+
+        if p2_dead and not p1_dead then
             clear_held()
-            print(string.format("[DIAG] FIN-RONDA VICTORIA | combate=%d NOOPs=%d Acciones=%d",
-                diag_combat_frame, diag_noop_count, diag_action_count))
-            transition("WIN_WAIT")
-        elseif st.p1_hp <= 0 then
+            print(string.format(
+                "[DIAG] FIN-RONDA VICTORIA | P1=%d P2=%d | cf=%d NOOPs=%d Acc=%d",
+                st.p1_hp, st.p2_hp, diag_combat_frame,
+                diag_noop_count, diag_action_count))
+            transition("ROUND_OVER_WAIT")
+
+        elseif p1_dead then
             clear_held()
-            print(string.format("[DIAG] FIN-RONDA DERROTA  | combate=%d NOOPs=%d Acciones=%d",
-                diag_combat_frame, diag_noop_count, diag_action_count))
-            transition("GAME_OVER_WAIT")
+            local tag = p2_dead and "DOUBLE KO" or "DERROTA"
+            print(string.format(
+                "[DIAG] FIN-RONDA %s | P1=%d P2=%d | cf=%d NOOPs=%d Acc=%d",
+                tag, st.p1_hp, st.p2_hp, diag_combat_frame,
+                diag_noop_count, diag_action_count))
+            transition("ROUND_OVER_WAIT")
+
+        elseif timeout then
+            clear_held()
+            local tag = (st.p1_hp > st.p2_hp) and "TIMEOUT VICTORIA" or "TIMEOUT DERROTA"
+            print(string.format(
+                "[DIAG] %s | P1=%d P2=%d | cf=%d/%d | timer_raw=0x%02X",
+                tag, st.p1_hp, st.p2_hp,
+                diag_combat_frame, MAX_COMBAT_FRAMES, st.timer_raw))
+            transition("ROUND_OVER_WAIT")
         end
 
         -- Log periódico en combate
-        if frame_count % 300 == 0 then
+        if diag_combat_frame % 300 == 0 then
             local fk = "tierra"
             if st.p2_airborne then
                 local a = st.p2_anim
@@ -508,32 +520,36 @@ local function on_frame()
                 elseif a == 0x0C then fk = "FK_STARTUP" end
             elseif st.p2_anim == 0x0C then fk = "BOOM/FK_LAND" end
             print(string.format(
-                "[F%d] P1=%d P2=%d X:%d-%d ANIM=0x%02X(%s) Y=%d BOOM:%s IMP:%s in_combat=true",
-                frame_count,st.p1_hp,st.p2_hp,st.p1_x,st.p2_x,
-                st.p2_anim,fk,st.p2_y_vel,
-                tostring(st.boom_active),tostring(st.boom_incoming)))
+                "[F%d] P1=%d P2=%d X:%d-%d ANIM=0x%02X(%s) Y=%d | "..
+                "TMR_EST=%ds TMR_RAW=0x%02X | cf=%d/%d | BOOM:%s",
+                frame_count, st.p1_hp, st.p2_hp, st.p1_x, st.p2_x,
+                st.p2_anim, fk, st.p2_y_vel,
+                st.timer, st.timer_raw,
+                diag_combat_frame, MAX_COMBAT_FRAMES,
+                tostring(st.boom_active)))
         end
 
     else
-        -- Menús: mover la máquina de estados
-        tick_menu(st.p1_hp, st.p2_hp)
+        tick_menu(st.p1_hp, st.p2_hp, st.timer_raw)
         if frame_count % 120 == 0 then
             local held_str = ""
             for k, _ in pairs(_held) do held_str = held_str .. k .. " " end
             if held_str == "" then held_str = "(ninguno)" end
-            print(string.format("[F%d] STATE=%-18s f=%d HP=%d/%d HELD:[%s]",
+            print(string.format(
+                "[F%d] STATE=%-22s f=%d HP=%d/%d TMR_EST=%d TMR_RAW=0x%02X HELD:[%s]",
                 frame_count, sm_state, state_frame,
-                st.p1_hp, st.p2_hp, held_str))
+                st.p1_hp, st.p2_hp, st.timer, st.timer_raw, held_str))
         end
     end
 
-    -- [FIX v1.7] flush_inputs al FINAL — después de todos los hold()/clear_held()
     flush_inputs()
 end
 
 emu.register_frame_done(on_frame, "frame")
 
-print("[ABridge] Bridge activo v1.10")
-print("  [v1.10] WAITING_COMBAT rechaza HP=255 (muerte SF2CE) + CONTINUE JAB")
+print("[ABridge] Bridge activo v1.13")
+print("  [v1.13] Timeout por frames internos — MAX_COMBAT_FRAMES=" .. MAX_COMBAT_FRAMES)
+print("  [v1.13] timer en state.txt = estimado por frames (timer_raw = RAM diagnóstico)")
+print("  [v1.11] ROUND_OVER_WAIT distingue ronda vs game over real")
 print("  -> " .. INPUT_FILE)
 print("  -> " .. STATE_FILE)
