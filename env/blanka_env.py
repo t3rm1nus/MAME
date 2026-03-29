@@ -1,24 +1,16 @@
 """
 blanka_env.py — Entorno Gymnasium Blanka vs Arcade (SF2CE / MAME 0.286)
 ========================================================================
-Versión: 2.7 (29/03/2026)
+Versión: 2.8 (29/03/2026)
 
-Cambios v2.7:
-  · [FIX] Recompensas del Rolling Attack aumentadas para compensar el coste
-    de crédito tardío de la macro de 69 frames. Sin este ajuste el agente
-    PPO aprendía que acción 15 "no sirve" porque la recompensa llega 69 steps
-    más tarde y el descuento la aplana. Nuevos valores:
-      Rolling con hit + distancia óptima : +30 (antes +12)
-      Rolling con hit fuera de distancia : +20 (antes +8)
-      Rolling en ventana post-FK con hit  : +35 (antes +15)
-      Rolling en ventana post-FK sin hit  : +8  (antes +4)
-      Rolling sin hit (penalización)      : -2  (antes -3/-1, más suave)
-    Además se añade bonus de carga acumulada (+0.05/step mientras se mantiene ←)
-    para que el agente aprenda que mantener ← tiene valor antes de ejecutar.
-  · [FIX] timer en _get_obs() ya es fiable (calculado por el Lua v1.13).
-    Eliminada la lógica de fallback por ep_step que ya no es necesaria.
-  · [MANTIENE] Todos los fixes de v2.6 (macros de salto 25f, Rolling 69f,
-    p1_dir real en reset()).
+Cambios v2.8:
+  · [NUEVO] Flag ROLLING_ONLY (línea ~45) para forzar acción 15 en cada step.
+    Útil para verificar que el Rolling funciona en ambos lados y medir hit rate.
+    Ponlo a True para activar, False para volver al modo PPO normal.
+    El agente sigue recibiendo obs/recompensas normales — solo se puentea
+    la selección de acción. No se borra ni comenta ningún otro movimiento.
+  · [MANTIENE] Todos los fixes de v2.7 (recompensas Rolling elevadas,
+    timer fiable por frames internos del Lua v1.13).
 """
 
 import os, time, sys
@@ -33,6 +25,16 @@ sys.path.insert(0, os.path.join(_HERE, ".."))
 
 from mame_bridge import MAMEBridge
 from core.rival_registry import RivalRegistry
+
+# ── MODO DEPURACIÓN ───────────────────────────────────────────────────────────
+# [v2.8] Pon ROLLING_ONLY = True para que Blanka ejecute Rolling en CADA step,
+# ignorando la política del agente. Útil para:
+#   · Verificar que el rolling funciona en ambos lados (izquierda y derecha).
+#   · Medir cuántos rollings conectan por combate (hit rate bruto).
+#   · Confirmar que la macro de 69f se ejecuta correctamente end-to-end.
+# El entorno sigue calculando obs, reward e info normalmente.
+# Pon False para volver al entrenamiento PPO normal.
+ROLLING_ONLY: bool = False
 
 # ── CONSTANTES ────────────────────────────────────────────────────────────────
 MAX_HP           = 144.0
@@ -135,6 +137,9 @@ FLIP_ACTIONS = {15, 17, 18, 19, 21, 22, 23}
 NOOP = SINGLE_FRAME_ACTIONS[0]
 N_ACTIONS = 24
 
+# ID de la acción Rolling (para ROLLING_ONLY)
+ACTION_ROLLING = 15
+
 
 def fk_phase_value(anim: int, p2_airborne: bool) -> float:
     if not p2_airborne: return 0.0
@@ -156,6 +161,11 @@ class BlankaEnv(gym.Env):
       20    → salto neutro + Fierce (25 frames)
       21-22 → salto atrás + ataque (25 frames)
       23    → Rolling al aterrizar (1 frame, solo en ventana)
+
+    [v2.8] Si ROLLING_ONLY=True, step() ignora la acción del agente
+    y siempre ejecuta ACTION_ROLLING (15). La macro maneja el flip
+    de dirección automáticamente según p1_dir, por lo que el rolling
+    funciona correctamente tanto mirando a la derecha como a la izquierda.
     """
     metadata = {"render_modes": ["human"]}
 
@@ -198,6 +208,10 @@ class BlankaEnv(gym.Env):
         self._jump_back_charge = 0
         self._rolling_jump_rdy = False
 
+        # [v2.8] Estadísticas de ROLLING_ONLY para diagnóstico por episodio
+        self._rolling_count  = 0
+        self._rolling_hits   = 0
+
     # ── OBSERVACIÓN ──────────────────────────────────────────────────────────
     def _get_obs(self, st: Optional[Dict]) -> np.ndarray:
         if st is None:
@@ -213,7 +227,7 @@ class BlankaEnv(gym.Env):
         p2stn = float(st.get("p2_stun",    0))
         p2his = int  (st.get("p2_hitstop", 0))
         p2anim= int  (st.get("p2_anim",    0))
-        # [v2.7] timer ya es fiable: calculado por frames internos en Lua v1.13
+        # [v2.7] timer ya es fiable: calculado por frames internos en Lua v1.13+
         timer = float(st.get("timer",      99))
         prj   = bool (st.get("boom_slot_active", False))
 
@@ -289,31 +303,26 @@ class BlankaEnv(gym.Env):
         # ── Rolling Attack (acción 15) ────────────────────────────────────────
         # [v2.7] Recompensas elevadas para compensar el crédito tardío
         # de la macro de 69 frames. Sin esto PPO aprende que rolling = malo.
-        if action == 15:
+        if action == ACTION_ROLLING:
             in_fk_window = 0 < self._fk_land_steps <= 20
             good_dist    = 200 <= dist <= 600
 
             if in_fk_window:
-                # Mejor contexto posible: Guile acaba de aterrizar del FK
                 r += 35.0 if dp2 > 0 else 8.0
             elif dp2 > 0:
-                # Rolling con hit fuera de ventana FK
                 r += 30.0 if good_dist else 20.0
             else:
-                # Rolling sin hit — penalización suave
                 if dist < 150:
-                    r -= 2.0   # muy cerca: inútil
+                    r -= 2.0
                 elif dist > 700:
-                    r -= 2.0   # muy lejos: inútil
+                    r -= 2.0
                 else:
-                    r -= 1.0   # distancia razonable pero no conectó
+                    r -= 1.0
 
         # ── Bonus de carga acumulada (← sostenido) ───────────────────────────
-        # [v2.7] Premio pequeño por mantener ← (acción 3 o acciones de salto
-        # atrás) para guiar al agente a construir la carga antes del Rolling.
         back = 3 if self._last_p1_dir == 1 else 4
         if action == back or action in (21, 22):
-            r += 0.05  # +0.05/step × 68 steps = +3.4 total de bonus de carga
+            r += 0.05
 
         # ── Electricidad (acción 16) ──────────────────────────────────────────
         if action == 16:
@@ -459,7 +468,16 @@ class BlankaEnv(gym.Env):
         self._p1_was_air = False; self._p1_land_steps = 0
         self._jump_back_charge = 0; self._rolling_jump_rdy = False
 
-        print(f"[BlankaEnv#{self.instance_id}] Reset...")
+        # [v2.8] Stats rolling_only por episodio
+        if ROLLING_ONLY and self._rolling_count > 0:
+            hit_rate = self._rolling_hits / max(1, self._rolling_count) * 100
+            print(f"[RollingOnly] EP anterior: {self._rolling_count} rollings, "
+                  f"{self._rolling_hits} hits ({hit_rate:.1f}%)")
+        self._rolling_count = 0
+        self._rolling_hits  = 0
+
+        print(f"[BlankaEnv#{self.instance_id}] Reset..."
+              + (" [ROLLING_ONLY]" if ROLLING_ONLY else ""))
 
         if self._soft_fails < self._MAX_SF:
             if not self.bridge.soft_reset(timeout=90.0):
@@ -498,7 +516,16 @@ class BlankaEnv(gym.Env):
 
     # ── STEP ─────────────────────────────────────────────────────────────────
     def step(self, action: int):
-        self._ep_step += 1; action = int(action)
+        self._ep_step += 1
+        action = int(action)
+
+        # [v2.8] ROLLING_ONLY: ignora la política del agente, fuerza rolling.
+        # El flip de dirección (izquierda/derecha) lo gestiona _resolve()
+        # automáticamente usando self._last_p1_dir, así que funciona en
+        # ambos lados sin ningún cambio adicional.
+        if ROLLING_ONLY:
+            action = ACTION_ROLLING
+
         st = self.bridge.step(self._resolve(action))
 
         if st is None:
@@ -515,8 +542,19 @@ class BlankaEnv(gym.Env):
         self._update_internals(st)
         p1hp = float(st.get("p1_hp", MAX_HP)); p2hp = float(st.get("p2_hp", MAX_HP))
         self._p1_hp_hist.append(self._prev_p1_hp); self._p2_hp_hist.append(self._prev_p2_hp)
+
+        dp2 = max(0.0, self._prev_p2_hp - p2hp)
         self._ep_p1_dmg += max(0.0, self._prev_p1_hp - p1hp)
-        self._ep_p2_dmg += max(0.0, self._prev_p2_hp - p2hp)
+        self._ep_p2_dmg += dp2
+
+        # [v2.8] Acumular stats de rolling_only
+        if ROLLING_ONLY and action == ACTION_ROLLING and not self._macro_active:
+            # Contamos el rolling cuando se dispara (macro_active acaba de activarse)
+            # En realidad lo contamos en el step que lo inicia.
+            # Detectamos inicio: macro_buf == 0 y no había macro antes
+            self._rolling_count += 1
+            if dp2 > 0:
+                self._rolling_hits += 1
 
         in_combat  = bool(st.get("in_combat", True))
         won        = p2hp <= 0 and p1hp > 0
@@ -537,6 +575,7 @@ class BlankaEnv(gym.Env):
             "rolling_jump": int(action == 23),
             "p1_land": self._p1_land_steps,
             "rolling_jump_rdy": int(self._rolling_jump_rdy),
+            "rolling_only": ROLLING_ONLY,
         }
 
     def render(self): pass
@@ -544,5 +583,3 @@ class BlankaEnv(gym.Env):
     def close(self):
         try: self.bridge.disconnect()
         except Exception: pass
-
-        

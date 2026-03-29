@@ -1,20 +1,13 @@
 -- =============================================================================
--- autoplay_bridge.lua  |  v1.13 |  SF2CE / MAME 0.286  |  29/03/2026
+-- autoplay_bridge.lua  |  v1.14 |  SF2CE / MAME 0.286  |  29/03/2026
 -- =============================================================================
--- CAMBIOS v1.13 (sobre v1.12):
---   · [FIX CRÍTICO] Eliminada toda detección de timeout basada en timer RAM.
---     La dirección 0xFF8ACE siempre devuelve 0 → falsos positivos en mitad
---     del combate. Reemplazado por contador de frames interno:
---       MAX_COMBAT_FRAMES = 6400 (> 99s × 60fps = 5940f, con margen del 7%)
---     Cuando diag_combat_frame >= MAX_COMBAT_FRAMES → timeout real por tiempo.
---   · [DIAG] El campo "timer" en state.txt ahora exporta un timer estimado
---     calculado como max(0, ceil((MAX_COMBAT_FRAMES - diag_combat_frame) / 60))
---     para que blanka_env.py tenga un timer útil aunque la RAM sea basura.
---   · [DIAG] Log del valor raw de 0xFF8ACE mantenido como "timer_raw" para
---     poder confirmar o descartar la dirección en el futuro.
--- CAMBIOS v1.12 (descartados):
---   · timer_zero_frames y timer_ever_valid eliminados (atacaban el síntoma,
---     no la causa raíz).
+-- CAMBIOS v1.14:
+--   · [FIX] PRESS_CONTINUE ahora pulsa "1 Player Start" en lugar de BTN_JAB.
+--     En SF2CE la pantalla de CONTINUE no acepta punches — requiere Start P1.
+--     Se añaden 3 pulsos espaciados (f=20, f=60, f=100) para mayor fiabilidad.
+-- CAMBIOS v1.13 (mantenidos):
+--   · Timeout por frames internos (MAX_COMBAT_FRAMES=6400). Sin lectura RAM timer.
+--   · timer en state.txt = estimado por frames. timer_raw = RAM diagnóstico.
 -- CAMBIOS v1.11 (mantenidos):
 --   · ROUND_OVER_WAIT distingue ronda vs game over real por HP.
 --   · Double KO → ROUND_OVER_WAIT.
@@ -23,7 +16,7 @@
 --   · WAITING_COMBAT rechaza HP=255 — tope MAX_HP_VALID=144.
 -- =============================================================================
 
-local BRIDGE_VERSION = "autoplay_bridge_v1.13"
+local BRIDGE_VERSION = "autoplay_bridge_v1.14"
 local BASE_DIR       = "C:\\proyectos\\MAME\\"
 local INPUT_FILE     = BASE_DIR .. "mame_input.txt"
 local STATE_FILE     = BASE_DIR .. "state.txt"
@@ -52,10 +45,9 @@ local ADDR = {
     P1_Y_VEL_H=0xFF83FC,
     P1_Y_VEL_L=0xFF83FD,
     PROJ_SLOT=0xFF8E30, PROJ_IMPACT=0xFF8E00,
-    TIMER=0xFF8ACE,  -- ⚠️ v1.13: dirección NO FIABLE (siempre 0). Solo diagnóstico.
+    TIMER=0xFF8ACE,  -- NO FIABLE (siempre 0). Solo diagnostico.
 }
 
--- [v1.13] Timeout por frames internos — 99s × 60fps = 5940f + 7% margen = 6400.
 local MAX_COMBAT_FRAMES = 6400
 
 -- ── NOMBRES DE BOTONES ────────────────────────────────────────────────────────
@@ -87,7 +79,6 @@ local _fields_ok = false
 
 local function try_init()
     if _mem_ok and _fields_ok then return true end
-
     if not _mem_ok then
         local ok, sp = pcall(function()
             return manager.machine.devices[":maincpu"].spaces["program"]
@@ -96,7 +87,6 @@ local function try_init()
             print("[ABridge] Memoria CPU lista.")
         end
     end
-
     if not _fields_ok then
         local ok, ports = pcall(function() return manager.machine.ioport.ports end)
         if ok and ports then
@@ -230,8 +220,6 @@ local function read_game_state()
     local p1air = (math.abs(p1yv) > 256)
     local p1land= prev_p1_airborne and not p1air
 
-    -- [v1.13] timer_raw = valor crudo de RAM (solo para diagnóstico en logs).
-    -- timer     = estimado por frames internos — usado por blanka_env.py.
     local timer_raw = ru8(ADDR.TIMER)
     local frames_remaining = math.max(0, MAX_COMBAT_FRAMES - diag_combat_frame)
     local timer_est = math.min(99, math.ceil(frames_remaining / 60))
@@ -262,8 +250,7 @@ local function read_game_state()
 
     return {p1_hp=p1hp, p2_hp=p2hp, p1_x=p1x, p2_x=p2x, p1_dir=p1dir,
             p1_char=p1char, p2_char=p2char,
-            timer=timer_est,       -- [v1.13] estimado por frames
-            timer_raw=timer_raw,   -- [v1.13] RAM cruda (diagnóstico)
+            timer=timer_est, timer_raw=timer_raw,
             p1_stun=p1st, p2_stun=p2st, p2_stunned=(p2ss==0x24),
             p2_crouch=p2cr, p2_anim=p2an, p2_y_vel=p2yv, p2_airborne=p2air,
             p1_anim=p1an, p1_y_vel=p1yv, p1_airborne=p1air,
@@ -402,9 +389,17 @@ local function tick_menu(p1hp, p2hp, timer_raw)
         if f == 66  then release("Coin 1") end
         if f >= 180 then transition("PRESS_CONTINUE") end
 
+    -- ── [v1.14] FIX CRÍTICO: PRESS_CONTINUE ──────────────────────────────────
+    -- SF2CE requiere "1 Player Start" en la pantalla de continue, no BTN_JAB.
+    -- 3 pulsos espaciados: cubre variaciones en el timing de aparición
+    -- de la pantalla de continue vs el momento de transición del estado.
     elseif sm_state == "PRESS_CONTINUE" then
-        if f == 20 then hold(BTN_JAB);   print("[ABridge] CONTINUE (JAB)") end
-        if f == 26 then release(BTN_JAB) end
+        if f == 20  then hold("1 Player Start");   print("[ABridge] CONTINUE (Start) — pulso 1") end
+        if f == 26  then release("1 Player Start") end
+        if f == 60  then hold("1 Player Start");   print("[ABridge] CONTINUE (Start) — pulso 2") end
+        if f == 66  then release("1 Player Start") end
+        if f == 100 then hold("1 Player Start");   print("[ABridge] CONTINUE (Start) — pulso 3") end
+        if f == 106 then release("1 Player Start") end
         if f >= 310 then transition("WAITING_COMBAT") end
     end
 end
@@ -478,8 +473,6 @@ local function on_frame()
         -- ── DETECCIÓN FIN DE RONDA ───────────────────────────────────────────
         local p1_dead = (st.p1_hp <= 0)
         local p2_dead = (st.p2_hp <= 0)
-
-        -- [v1.13] Timeout SOLO por frames internos. NO se lee la RAM del timer.
         local timeout = (diag_combat_frame >= MAX_COMBAT_FRAMES)
 
         if p2_dead and not p1_dead then
@@ -509,7 +502,6 @@ local function on_frame()
             transition("ROUND_OVER_WAIT")
         end
 
-        -- Log periódico en combate
         if diag_combat_frame % 300 == 0 then
             local fk = "tierra"
             if st.p2_airborne then
@@ -547,9 +539,10 @@ end
 
 emu.register_frame_done(on_frame, "frame")
 
-print("[ABridge] Bridge activo v1.13")
+print("[ABridge] Bridge activo v1.14")
+print("  [v1.14] FIX: PRESS_CONTINUE usa '1 Player Start' (3 pulsos f=20/60/100)")
 print("  [v1.13] Timeout por frames internos — MAX_COMBAT_FRAMES=" .. MAX_COMBAT_FRAMES)
-print("  [v1.13] timer en state.txt = estimado por frames (timer_raw = RAM diagnóstico)")
+print("  [v1.13] timer en state.txt = estimado por frames (timer_raw = RAM diagnostico)")
 print("  [v1.11] ROUND_OVER_WAIT distingue ronda vs game over real")
 print("  -> " .. INPUT_FILE)
 print("  -> " .. STATE_FILE)

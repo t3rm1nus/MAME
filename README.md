@@ -10,7 +10,7 @@ Entrenamiento de un agente de Aprendizaje por Refuerzo para dominar a Blanka en 
 ## 🧱 ARQUITECTURA TÉCNICA
 * Bridge bidireccional vía archivos (`mame_input.txt` + `state.txt`) — `mame_bridge.py`.
 * `force_rolling_final.lua` ejecuta el Rolling Attack 100% fiable (bola + avance).
-* `env/blanka_env.py` — entorno Gymnasium (Discrete 17 acciones, obs 28-dim).
+* `env/blanka_env.py` — entorno Gymnasium (Discrete 24 acciones, obs 30-dim).
 * `lua/lua_bridge.lua` — escribe `state.txt` cada frame, lee `mame_input.txt`.
 * `core/rival_registry.py` — registro persistente de estadísticas por rival.
 
@@ -50,13 +50,16 @@ Entrenamiento de un agente de Aprendizaje por Refuerzo para dominar a Blanka en 
 
 ## ✅ LOGROS ALCANZADOS (28/03/2026 — sesión 3)
 - [x] **`mame_bridge.py` creado** — bridge de archivos Python↔MAME con API limpia.
-- [x] **`env/blanka_env.py` v2.1** — claves de estado alineadas con lua_bridge v2.0:
-  - `p2_char_id` → `p2_char`
-  - `proj_active` → `boom_slot_active`
-  - `p2_action` → `p2_anim`
-  - `p2_crouch` ahora real (antes fijo a 0.0)
+- [x] **`env/blanka_env.py` v2.1** — claves de estado alineadas con lua_bridge v2.0.
 - [x] **`core/rival_registry.py`** — registro persistente de estadísticas por rival.
 - [x] **`train_blanka_v1.py`** — entrenamiento PPO single-env visible.
+
+## ✅ LOGROS ALCANZADOS (29/03/2026)
+- [x] **`autoplay_bridge.lua` v1.13** — timer fiable por frames internos (MAX_COMBAT_FRAMES=6400). Eliminada la lectura de RAM `0xFF8ACE` (siempre 0). `timer` en state.txt = estimado; `timer_raw` = diagnóstico.
+- [x] **`env/blanka_env.py` v2.7** — recompensas Rolling elevadas para compensar crédito tardío de macro 69f. Bonus de carga acumulada (+0.05/step). Timer fiable.
+- [x] **`autoplay_bridge.lua` v1.14** — `PRESS_CONTINUE` usa `"1 Player Start"` (3 pulsos). Fix crítico: JAB no registra en pantalla de continue de SF2CE.
+- [x] **`env/blanka_env.py` v2.8** — flag `ROLLING_ONLY` para modo depuración (fuerza acción 15 en cada step). Funciona en ambos lados. Stats hit rate por episodio.
+- [x] **`autoplay_bridge.lua` v1.15** — nuevo estado `CHAR_SELECT_CONTINUE`. Tras el continue SF2CE muestra char select con cursor en Blanka; el bridge pulsa JAB (2 pulsos) para confirmar de inmediato sin esperar el timeout de ~9s.
 
 ---
 
@@ -79,12 +82,19 @@ pip install gymnasium stable-baselines3 torch
 ### Pasos
 1. Abre MAME con el Lua bridge:
 ```
-mame64.exe sf2ce -autoboot_script lua\lua_bridge.lua
+mame64.exe sf2ce -autoboot_script lua\autoplay_bridge.lua
 ```
-2. Navega manualmente a un combate (o espera a que `autoplay_bridge.lua` lo haga automáticamente — pendiente).
+2. El bridge navega automáticamente: INSERT_COIN → PRESS_START → CHAR_NAVIGATE → CHAR_CONFIRM → IN_COMBAT.
 3. Lanza el entrenamiento:
 ```bat
 python train_blanka_v1.py
+```
+
+### Modo depuración Rolling (ROLLING_ONLY)
+En `env/blanka_env.py`, línea ~45:
+```python
+ROLLING_ONLY: bool = True   # fuerza rolling en cada step
+ROLLING_ONLY: bool = False  # entrenamiento PPO normal
 ```
 
 ### Ver estadísticas por rival
@@ -97,17 +107,18 @@ python train_blanka_v1.py --stats
 ## 📁 Estructura actual
 ```
 C:\proyectos\MAME\
-├── mame_bridge.py          ← bridge Python↔MAME (archivos)
-├── train_blanka_v1.py      ← entrenamiento PPO single-env
+├── mame_bridge.py
+├── train_blanka_v1.py
 ├── config\
 │   └── constants.py
 ├── core\
 │   └── rival_registry.py
 ├── env\
-│   └── blanka_env.py
+│   └── blanka_env.py          ← v2.8 (ROLLING_ONLY flag)
 ├── lua\
-│   ├── lua_bridge.lua      ← bridge Lua activo (v2.0)
-│   └── autostart_v33.lua   ← diagnóstico P1/P2/MODO
+│   ├── autoplay_bridge.lua    ← v1.15 (CHAR_SELECT_CONTINUE)
+│   ├── lua_bridge.lua
+│   └── autostart_v33.lua
 ├── force_rolling_final.lua
 ├── train.py
 ├── direcciones_ram
@@ -116,6 +127,60 @@ C:\proyectos\MAME\
 └── legacy\
     └── tests\
 ```
+
+---
+
+## 🔄 FLUJO COMPLETO DE LA MÁQUINA DE ESTADOS (autoplay_bridge v1.15)
+
+```
+BOOTING
+  └─> DISMISS_WARNING        (360f boot)
+        └─> INSERT_COIN      (pulsa Coin 1)
+              └─> PRESS_START (pulsa 1P Start)
+                    └─> CHAR_NAVIGATE   (2× RIGHT para Blanka)
+                          └─> CHAR_CONFIRM  (JAB)
+                                └─> WAITING_COMBAT
+                                      └─> IN_COMBAT ──── victoria/derrota/timeout
+                                                              └─> ROUND_OVER_WAIT
+                                                                    ├─ HP restaurados → WAITING_COMBAT (siguiente ronda)
+                                                                    └─ timeout (360f)  → GAME_OVER_WAIT
+                                                                                              └─> PRESS_CONTINUE (3× Start)
+                                                                                                    └─> CHAR_SELECT_CONTINUE (JAB ×2)
+                                                                                                          └─> WAITING_COMBAT
+```
+
+---
+
+## 🎮 ESPACIO DE ACCIONES (blanka_env.py v2.8)
+
+| ID | Acción | Tipo | Frames |
+|----|--------|------|--------|
+| 0 | NOOP | single | 1 |
+| 1 | UP | single | 1 |
+| 2 | DOWN | single | 1 |
+| 3 | LEFT | single | 1 |
+| 4 | RIGHT | single | 1 |
+| 5 | JAB | single | 1 |
+| 6 | STRONG | single | 1 |
+| 7 | FIERCE | single | 1 |
+| 8 | SHORT | single | 1 |
+| 9 | FORWARD | single | 1 |
+| 10 | ROUNDHOUSE | single | 1 |
+| 11 | DOWN+JAB | single | 1 |
+| 12 | DOWN+FIERCE | single | 1 |
+| 13 | DOWN+SHORT | single | 1 |
+| 14 | DOWN+RH | single | 1 |
+| 15 | **ROLLING ATTACK** | macro | 69 |
+| 16 | ELECTRICIDAD | macro | 5 |
+| 17 | SALTO FWD + FIERCE | macro | 25 |
+| 18 | SALTO FWD + FORWARD | macro | 25 |
+| 19 | SALTO FWD + RH | macro | 25 |
+| 20 | SALTO NEUTRO + FIERCE | macro | 25 |
+| 21 | SALTO ATRÁS + FIERCE | macro | 25 |
+| 22 | SALTO ATRÁS + FORWARD | macro | 25 |
+| 23 | ROLLING JUMP (ventana aterrizaje) | macro | 1 |
+
+Las acciones con flip (15, 17-19, 21-23) invierten LEFT↔RIGHT automáticamente según `p1_dir`.
 
 ---
 
@@ -165,34 +230,35 @@ PERSONAJES
   P2_CHAR_ADDR    = 0xFF894F  (ID directo 0-11)
 
 MODO (ARCADE vs VS)
-  MODO_BLOCK_START = 0xFF87E0  ← 32 bytes hasta 0xFF87FF
-  Lógica: any(byte != 0) → ARCADE | all(byte == 0) → VS
+  MODO_BLOCK_START = 0xFF87E0  <- 32 bytes hasta 0xFF87FF
+  Logica: any(byte != 0) -> ARCADE | all(byte == 0) -> VS
 
-CRONÓMETRO
-  TIMER_ADDR      = 0xFF8ACE
+CRONOMETRO
+  TIMER_ADDR      = 0xFF8ACE  (NO FIABLE — siempre devuelve 0)
+  Usar timer estimado del bridge: MAX_COMBAT_FRAMES=6400 / 60fps
 
-POSICIÓN X (16-bit big-endian)
+POSICION X (16-bit big-endian)
   P1_X_H_ADDR     = 0xFF917C  P1_X_L_ADDR = 0xFF917D
   P2_X_H_ADDR     = 0xFF927C  P2_X_L_ADDR = 0xFF927D
-  Rango P2: 0x02D8 (728) – 0x0357 (855) | Mayor = más a la derecha
+  Rango P2: 0x02D8 (728) - 0x0357 (855) | Mayor = mas a la derecha
 
 STUN
   P2_STUN_ADDR        = 0xFF865A  (+5/hit)
   P2_STUN_SPRITE_ADDR = 0xFF8951  (0x24 = pajaritos activos)
   P1_STUN_ADDR        = 0xFF895A
 
-POSE / ANIMACIÓN
+POSE / ANIMACION
   P2_CROUCH_FLAG_ADDR = 0xFF86C4  (0x03=agachado | 0x02=de pie)
   P2_ANIM_FRAME_ADDR  = 0xFF86C1
 
-FLASH KICK — ANATOMÍA DEFINITIVA (mapeo_guile_v4 — 28/03/2026)
+FLASH KICK — ANATOMIA DEFINITIVA (mapeo_guile_v4 — 28/03/2026)
   Fase        ANIM   Y_VEL   Frame
-  Startup     0x0C   −288    f+0
-  Ascenso     0x02   −2304   f+26
-  Cima        0x00   −2304   f+123
+  Startup     0x0C   -288    f+0
+  Ascenso     0x02   -2304   f+26
+  Cima        0x00   -2304   f+123
   Descenso    0x04   +1760   f+126
   Landing     0x0C   ~0      f+150
-  ⚠️ 0x0C ambiguo: abs(Y_VEL)>256 → FK | ~0 → Boom throw o Landing
+  ⚠️ 0x0C ambiguo: abs(Y_VEL)>256 -> FK | ~0 -> Boom throw o Landing
 
 AIRBORNE
   P2_Y_VEL_H = 0xFF86FC  P2_Y_VEL_L = 0xFF86FD  (signed 16-bit; abs>256 = aire)
@@ -207,7 +273,7 @@ PROYECTIL SONIC BOOM
 ---
 
 ## 🔜 PRÓXIMO PASO
-- Crear `lua/autoplay_bridge.lua` con máquina de estados para navegación automática de menús (INSERT_COIN → CHAR_SELECT → COMBAT → CONTINUE).
 - Arrancar entrenamiento PPO extendido vs Guile determinista.
+- Validar `CHAR_SELECT_CONTINUE` con log en el siguiente game over.
 
 **Meta final:** 100% winrate + perfects en todos los combates vs Guile determinista.

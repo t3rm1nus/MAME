@@ -1,1 +1,1 @@
-autoplay_bridge_v1.13
+autoplay_bridge_v1.14

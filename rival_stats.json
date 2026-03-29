@@ -1,11 +1,11 @@
 {
   "4": {
-    "episodes": 36,
-    "wins": 0,
-    "losses": 36,
-    "total_p1_dmg": 3900.0,
-    "total_p2_dmg": 1968.0,
-    "win_rate": 0.0,
-    "last_seen": "2026-03-29 18:43:18"
+    "episodes": 43,
+    "wins": 1,
+    "losses": 42,
+    "total_p1_dmg": 5094.0,
+    "total_p2_dmg": 3446.0,
+    "win_rate": 0.023255813953488372,
+    "last_seen": "2026-03-29 19:38:55"
   }
 }
