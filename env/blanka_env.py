@@ -49,8 +49,9 @@ CHAR_NAMES = {
 
 # ── ACTION SPACE ──────────────────────────────────────────────────────────────
 SINGLE_FRAME_ACTIONS: List[List[int]] = [
+    # [UP, DOWN, LEFT, RIGHT, JAB, STRONG, FIERCE, SHORT, FORWARD, RH, ?, ?]
     [0,0,0,0,0,0,0,0,0,0,0,0],  #  0  NOOP
-    [1,0,0,0,0,0,0,0,0,0,0,0],  #  1  UP
+    [1,0,0,0,0,0,0,0,0,0,0,0],  #  1  UP (salto neutro)
     [0,1,0,0,0,0,0,0,0,0,0,0],  #  2  DOWN
     [0,0,1,0,0,0,0,0,0,0,0,0],  #  3  LEFT
     [0,0,0,1,0,0,0,0,0,0,0,0],  #  4  RIGHT
@@ -64,6 +65,15 @@ SINGLE_FRAME_ACTIONS: List[List[int]] = [
     [0,1,0,0,0,0,1,0,0,0,0,0],  # 12  DOWN+FIERCE
     [0,1,0,0,0,0,0,1,0,0,0,0],  # 13  DOWN+SHORT
     [0,1,0,0,0,0,0,0,0,1,0,0],  # 14  DOWN+RH
+    # 15=MACRO_ROLLING, 16=MACRO_ELECTRIC (ver MACROS dict)
+    # Salto adelante + ataque — muy efectivos en SF2
+    [1,0,0,1,0,0,1,0,0,0,0,0],  # 17  UP+RIGHT+FIERCE  (salto adelante + puño fuerte)
+    [1,0,0,1,0,0,0,0,0,1,0,0],  # 18  UP+RIGHT+FORWARD (salto adelante + patada media)
+    [1,0,0,1,0,0,0,0,0,0,1,0],  # 19  UP+RIGHT+RH      (salto adelante + roundhouse)
+    [1,0,0,0,0,0,1,0,0,0,0,0],  # 20  UP+FIERCE        (salto neutro + puño fuerte)
+    # Salto atrás + ataque — escape + contraataque
+    [1,0,1,0,0,0,1,0,0,0,0,0],  # 21  UP+LEFT+FIERCE   (salto atrás + puño fuerte)
+    [1,0,1,0,0,0,0,0,0,1,0,0],  # 22  UP+LEFT+FORWARD  (salto atrás + patada media)
 ]
 MACRO_ROLLING: List[List[int]] = (
     [[0,0,1,0,0,0,0,0,0,0,0,0]] * 21 +
@@ -72,6 +82,7 @@ MACRO_ROLLING: List[List[int]] = (
 MACRO_ELECTRIC: List[List[int]] = [[0,0,0,0,1,0,0,0,0,0,0,0]] * 5
 MACROS: Dict[int, List[List[int]]] = {15: MACRO_ROLLING, 16: MACRO_ELECTRIC}
 NOOP = SINGLE_FRAME_ACTIONS[0]
+N_ACTIONS = 23  # total acciones (0-14 single, 15-16 macros, 17-22 saltos)
 
 
 def fk_phase_value(anim: int, p2_airborne: bool) -> float:
@@ -86,7 +97,7 @@ def fk_phase_value(anim: int, p2_airborne: bool) -> float:
 class BlankaEnv(gym.Env):
     """
     observation_space: Box(28,) float32
-    action_space:      Discrete(17)
+    action_space:      Discrete(23)  # 0-14 single, 15-16 macros, 17-22 saltos+ataque
       15 = Rolling Attack macro | 16 = Electric Thunder macro
     """
     metadata = {"render_modes": ["human"]}
@@ -101,7 +112,7 @@ class BlankaEnv(gym.Env):
         self.bridge      = MAMEBridge(instance_id=instance_id)
 
         self.observation_space = spaces.Box(-1.0, 1.0, shape=(28,), dtype=np.float32)
-        self.action_space      = spaces.Discrete(17)
+        self.action_space      = spaces.Discrete(N_ACTIONS)
 
         self._prev_p1_hp    = MAX_HP
         self._prev_p2_hp    = MAX_HP
@@ -183,7 +194,7 @@ class BlankaEnv(gym.Env):
             float(self._gnd_steps > 30),         # 24
             float(p2his > 0),                    # 25
             float(self._fk_land_steps > 0 and self._fk_land_steps <= 20),  # 26
-            self._last_action / 16.0,            # 27
+            self._last_action / float(N_ACTIONS - 1),            # 27
         ], dtype=np.float32)
         return np.clip(obs, -1.0, 1.0)
 
@@ -226,6 +237,25 @@ class BlankaEnv(gym.Env):
 
         if self._ep_step > 50 and dp2 == 0 and dp1 == 0: r -= 0.002
         if p2x < 100 or p2x > 1300: r += 1.0
+
+        # Recompensas para saltos con ataque (acciones 17-22)
+        JUMP_ATTACKS = (17, 18, 19, 20, 21, 22)
+        if action in JUMP_ATTACKS:
+            if dp2 > 0:
+                # Golpeó al rival saltando — muy bueno
+                r += 6.0
+                if 150 <= dist <= 500:
+                    r += 4.0   # distancia óptima de salto
+            elif p1a and dp1 > 0:
+                # Saltó y recibió daño — penalizar salto arriesgado
+                r -= 3.0
+            # Salto adelante (17-19) cuando viene boom — recompensa esquivar
+            if action in (17, 18, 19) and sb:
+                r += 6.0
+            # Penalizar salto en neutral sin razón táctica (no hay boom, no hay FK)
+            if not sb and self._fk_land_steps == 0 and dist > 600:
+                r -= 1.0
+
         return float(r)
 
     # ── MACRO ENGINE ─────────────────────────────────────────────────────────
@@ -243,7 +273,14 @@ class BlankaEnv(gym.Env):
                 seq = [[f[0],f[1],f[3],f[2]]+f[4:] for f in seq]
             self._macro_active = True; self._macro_seq = seq
             self._macro_buf = len(seq); return self._macro_seq.pop(0)
-        return SINGLE_FRAME_ACTIONS[action] if action < len(SINGLE_FRAME_ACTIONS) else NOOP
+        if action < len(SINGLE_FRAME_ACTIONS):
+            buttons = list(SINGLE_FRAME_ACTIONS[action])
+            # Acciones 17-22: flip LEFT/RIGHT si Blanka mira izquierda
+            # para que salto adelante siempre sea hacia el rival
+            if action in (17, 18, 19, 21, 22) and self._last_p1_dir == 0:
+                buttons[2], buttons[3] = buttons[3], buttons[2]
+            return buttons
+        return NOOP
 
     def _update_charge(self, action: int):
         if action == 15: self._charge = 0; return
