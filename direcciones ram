@@ -1,0 +1,32 @@
+VIDA
+local P1_HP_ADDR = 0xFF83E9
+local P2_HP_ADDR = 0xFF86E9
+
+LADO
+P1_SIDE = 0xFF83D0 (9 flips reales)
+P2_SIDE = 0xFF86D0 (18 flips reales)
+
+
+
+# CHARACTER IDs
+P1_CHAR_ID_BASE  = 0xFF8323   # scan: id = (addr_con_1 - base) // 2
+P2_CHAR_ID_ADDR  = 0xFF8660   # lectura directa: 0=Ryu,1=Honda,2=Blanka,3=Guile...
+
+
+0 Ryu 0xFF8323
+1 Honda 0xFF8325
+
+ID  Personaje  Dirección P1
+0 Ryu 0xFF8323
+1 Honda 0xFF8325
+2 Blanka 0xFF8327 
+3 Guile 0xFF8329 
+4 Ken 0xFF832B 
+5 Chun-Li 0xFF832D 
+6 Zangief 0xFF832F 
+7 Dalshim 0xFF8331
+8 Bison 0xFF8333 
+9 Sagat 0xFF8335
+10 Balrog 0xFF8337 
+11 Vega 0xFF8339
+
