@@ -1,1 +1,5 @@
+<<<<<<< HEAD
+{"p1_hp":0,"p2_hp":0,"p1_x":0,"p2_x":0,"p1_dir":1,"p1_char":0,"p2_char":4,"timer":0,"p1_stun":0,"p2_stun":0,"p2_stunned":false,"p2_crouch":false,"p2_anim":0,"p2_y_vel":0,"p2_airborne":false,"p1_airborne":false,"boom_active":false,"boom_x_est":0.0,"boom_incoming":true,"boom_slot_active":true,"boom_throw_this_frame":false,"fk_landing_this_frame":false,"p2_hitstop":0,"in_combat":false,"frame":9373}
+=======
 {"p1_hp":0,"p2_hp":0,"p1_x":0,"p2_x":0,"p1_dir":1,"p1_char":0,"p2_char":0,"timer":0,"p1_stun":0,"p2_stun":0,"p2_stunned":false,"p2_crouch":false,"p2_anim":0,"p2_y_vel":0,"p2_airborne":false,"p1_airborne":false,"boom_active":false,"boom_x_est":0,0,"boom_incoming":true,"boom_slot_active":false,"boom_throw_this_frame":false,"fk_landing_this_frame":false,"p2_hitstop":0,"in_combat":false,"frame":6779}
+>>>>>>> 487d32d03f00355dc78bbb22fb4d226e2cb07f0e

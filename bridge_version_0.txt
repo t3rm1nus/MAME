@@ -1,1 +1,5 @@
+<<<<<<< HEAD
+autoplay_bridge_v1.7
+=======
 autoplay_bridge_v1.6
+>>>>>>> 487d32d03f00355dc78bbb22fb4d226e2cb07f0e
