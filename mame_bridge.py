@@ -1,24 +1,20 @@
 """
 mame_bridge.py — Bridge Python↔MAME via archivos (state.txt / mame_input.txt)
 ==============================================================================
-Versión: 1.2 (29/03/2026)
+Versión: 1.3 (29/03/2026)
 
-Cambios v1.2 — FIX CRÍTICO json_error al 100%:
-  · _read_state() ya no usa sleep fijo de 1/60s. Ahora usa polling activo:
-    espera hasta que el frame_id en state.txt cambie respecto al anterior.
-    Esto garantiza que Python siempre lee un frame NUEVO escrito por Lua,
-    eliminando la race condition donde se leía el archivo a mitad de escritura
-    o se leía el mismo frame dos veces.
-  · Timeout de polling: 500ms (30 frames a 60fps). Si Lua no escribe en
-    500ms es señal de que MAME está pausado o colgado.
-  · Reintentos de JSON (heredados de v1.1) mantenidos como segunda línea
-    de defensa contra escrituras parciales.
-  · step() ya no hace time.sleep() propio — el sleep está dentro de
-    _wait_new_frame() como parte del polling.
+Cambios v1.3:
+  · [PATHS] Archivos de bridge movidos a BASE_DIR\dinamicos\.
+    Ahora los paths son siempre con sufijo _N (instance_id), incluso para N=0:
+      dinamicos\mame_input_0.txt   dinamicos\state_0.txt
+    Esto es consistente con el Lua v1.17 y con los train scripts v1.2.
+  · El directorio dinamicos\ se crea automáticamente si no existe.
 
-Cambios v1.1 (recordatorio):
-  · _read_state() reintentaba 3 veces con 2ms si leía vacío o JSON inválido.
-  · soft_reset() exige "in_combat"=True además de HP >= MIN_HP_VALID.
+Cambios v1.2 (mantenidos):
+  · Polling activo en _wait_new_frame() para eliminar json_error al 100%.
+
+Cambios v1.1 (mantenidos):
+  · soft_reset() exige in_combat=True además de HP >= MIN_HP_VALID.
 """
 
 import json
@@ -29,6 +25,7 @@ from typing import Optional, Dict, List
 
 # ── RUTAS POR DEFECTO ─────────────────────────────────────────────────────────
 BASE_DIR   = r"C:\proyectos\MAME"
+DYN_DIR    = os.path.join(BASE_DIR, "dinamicos")   # ← todos los archivos de sesion aqui
 MAME_EXE   = r"C:\proyectos\MAME\EMULADOR\mame.exe"
 MAME_ROM   = "sf2ce"
 MAME_LUASC = r"C:\proyectos\MAME\lua\autoplay_bridge.lua"
@@ -36,11 +33,11 @@ MAME_LUASC = r"C:\proyectos\MAME\lua\autoplay_bridge.lua"
 MIN_HP_VALID = 100
 
 # Polling: tiempo máximo esperando un frame nuevo de Lua
-_FRAME_POLL_TIMEOUT = 0.5    # 500ms — si Lua no escribe en este tiempo, hay problema
-_FRAME_POLL_SLEEP   = 0.001  # 1ms entre checks de polling
+_FRAME_POLL_TIMEOUT = 0.5    # 500ms
+_FRAME_POLL_SLEEP   = 0.001  # 1ms entre checks
 
 # Reintentos de parseo JSON si el archivo tiene contenido parcial
-_READ_RETRIES    = 5
+_READ_RETRIES     = 5
 _READ_RETRY_DELAY = 0.002   # 2ms
 
 
@@ -48,37 +45,48 @@ class MAMEBridge:
     """
     Bridge de archivos Python↔MAME.
 
+    Paths usados (todos en DYN_DIR):
+      dinamicos/mame_input_{instance_id}.txt   ← Python escribe inputs
+      dinamicos/state_{instance_id}.txt         ← Lua escribe estado
+      dinamicos/reset_signal_{instance_id}.txt  ← señal de reset
+
     Uso básico:
         bridge = MAMEBridge(instance_id=0)
         state  = bridge.step([0]*12)   # NOOP, devuelve dict con estado
         bridge.disconnect()
     """
 
-    def __init__(self, instance_id: int = 0, base_dir: str = BASE_DIR):
+    def __init__(self, instance_id: int = 0,
+                 base_dir: str = BASE_DIR,
+                 dyn_dir: Optional[str] = None):
         self.instance_id = instance_id
         self._base       = base_dir
 
-        sfx = "" if instance_id == 0 else f"_{instance_id}"
-        self._input_file = os.path.join(base_dir, f"mame_input{sfx}.txt")
-        self._state_file = os.path.join(base_dir, f"state{sfx}.txt")
-        self._reset_file = os.path.join(base_dir, f"reset_signal{sfx}.txt")
+        # Directorio de archivos dinamicos (puede sobreescribirse)
+        _dyn = dyn_dir or os.path.join(base_dir, "dinamicos")
+        os.makedirs(_dyn, exist_ok=True)
+
+        # Paths siempre con sufijo _N para consistencia con el Lua v1.17
+        sid = str(instance_id)
+        self._input_file = os.path.join(_dyn, f"mame_input_{sid}.txt")
+        self._state_file = os.path.join(_dyn, f"state_{sid}.txt")
+        self._reset_file = os.path.join(_dyn, f"reset_signal_{sid}.txt")
 
         self._mame_proc: Optional[subprocess.Popen] = None
         self._last_state: Optional[Dict]             = None
-        self._last_frame_id: int                     = -1  # último frame leído
+        self._last_frame_id: int                     = -1
 
         # Contadores de diagnóstico
         self._read_fail_count  = 0
         self._read_ok_count    = 0
         self._last_fail_report = 0
 
-        os.makedirs(base_dir, exist_ok=True)
         self._write_input([0] * 12)
 
     # ── I/O ──────────────────────────────────────────────────────────────────
 
     def _write_input(self, buttons: List[int]) -> bool:
-        """Escribe los 12 botones en mame_input.txt como CSV."""
+        """Escribe los 12 botones en mame_input_N.txt como CSV."""
         line = ",".join(str(int(b)) for b in buttons[:12])
         try:
             with open(self._input_file, "w", encoding="ascii") as f:
@@ -90,7 +98,7 @@ class MAMEBridge:
 
     def _parse_state_file(self) -> Optional[Dict]:
         """
-        Lee y parsea state.txt. Reintenta hasta _READ_RETRIES veces si
+        Lee y parsea state_N.txt. Reintenta hasta _READ_RETRIES veces si
         el archivo está vacío o el JSON es inválido (escritura parcial de Lua).
         """
         for attempt in range(_READ_RETRIES):
@@ -124,15 +132,9 @@ class MAMEBridge:
 
     def _wait_new_frame(self, timeout: float = _FRAME_POLL_TIMEOUT) -> Optional[Dict]:
         """
-        [FIX v1.2] Espera activamente hasta que Lua escriba un frame NUEVO
-        en state.txt (frame_id distinto al último leído).
-
-        Esto reemplaza el time.sleep(1/60) fijo que causaba el 100% json_error:
-        con sleep fijo, Python podía leer el archivo exactamente mientras Lua
-        lo estaba reescribiendo (ventana de 0 bytes). Con polling, esperamos
-        a que el contenido sea válido Y sea un frame nuevo.
-
-        Retorna el dict del nuevo frame, o None si timeout.
+        Espera activamente hasta que Lua escriba un frame NUEVO en state_N.txt
+        (frame_id distinto al último leído). Retorna el dict del nuevo frame,
+        o None si timeout.
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -140,13 +142,10 @@ class MAMEBridge:
             if st is not None:
                 frame_id = st.get("frame", -1)
                 if frame_id != self._last_frame_id:
-                    # Frame nuevo — actualizar y devolver
                     self._last_frame_id = frame_id
                     return st
-            # Frame no disponible aún o mismo frame — esperar un poco
             time.sleep(_FRAME_POLL_SLEEP)
 
-        # Timeout — devolver None
         self._record_fail("timeout")
         return None
 
@@ -165,10 +164,7 @@ class MAMEBridge:
     def step(self, buttons: List[int]) -> Optional[Dict]:
         """
         Envía inputs a MAME y espera el siguiente frame.
-
-        [FIX v1.2] Ya no usa time.sleep(1/60). En su lugar, _wait_new_frame()
-        hace polling hasta que Lua escriba un frame con frame_id distinto al
-        anterior. Esto garantiza que cada step() lee exactamente 1 frame nuevo.
+        Polling activo: garantiza que cada step() lee exactamente 1 frame nuevo.
         """
         self._write_input(buttons)
         st = self._wait_new_frame()
@@ -188,7 +184,7 @@ class MAMEBridge:
 
         deadline = time.time() + timeout
         while time.time() < deadline:
-            st = self._parse_state_file()  # lectura directa, sin esperar frame nuevo
+            st = self._parse_state_file()
             if st:
                 p1 = int(st.get("p1_hp", 0))
                 p2 = int(st.get("p2_hp", 0))
@@ -201,7 +197,6 @@ class MAMEBridge:
                             pass
                         return True
                 else:
-                    # Fallback para Lua antiguo sin campo in_combat
                     if p1 >= MIN_HP_VALID and p2 >= MIN_HP_VALID:
                         try:
                             os.remove(self._reset_file)

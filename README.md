@@ -273,7 +273,38 @@ PROYECTIL SONIC BOOM
 ---
 
 ## 🔜 PRÓXIMO PASO
-- Arrancar entrenamiento PPO extendido vs Guile determinista.
-- Validar `CHAR_SELECT_CONTINUE` con log en el siguiente game over.
+  ENTRENAMIENTO PPO
+  4. Curriculum learning — Planning completo
 
-**Meta final:** 100% winrate + perfects en todos los combates vs Guile determinista.
+Fase CL-1: ROLLING_ONLY Y ROLLING puro (ya tienes el flag)
+
+ROLLING_AND_ELECTRIC_ONLY = True, 200-500 episodios
+Objetivo: que el modelo entienda la geometría del rolling y del electric (distancia, dirección, timing post-FK)
+Métrica de salida: hit rate > 40%
+
+Fase CL-2: Defensa ante Boom y FK
+
+Nueva flag DEFENSE_ONLY = True — fuerza acciones 1 (UP para saltar Boom), 3/4 (moverse), 23 (rolling-jump)
+Se desactivan acciones de ataque por completo en esta fase
+Objetivo: que el agente nunca reciba daño de Boom ni FK
+Métrica de salida: daño recibido promedio < 20 HP por episodio
+
+Fase CL-3: Ofensiva combinada (saltos + rolling)
+
+Activar acciones 15-23, desactivar 0-14 excepto NOOP y direcciones
+Sin macros de un solo frame al principio — forzar exploración de macros con action_mask
+Objetivo: que el agente conecte al menos 1 rolling + 1 salto por episodio
+Métrica: ep_p2_dmg > 30 en promedio
+
+Fase CL-4: PPO completo sin restricciones
+
+Cargar el modelo entrenado en Fase CL-3 como punto de partida
+Las 24 acciones disponibles, recompensas normales
+Objetivo final: winrate > 70%, después escalar a 100% + perfects
+
+Implementación técnica: Una clase CurriculumScheduler que inspecciona métricas del RivalRegistry y cambia flags entre fases. Se puede integrar en train_blanka_v1.py con un callback de SB3.
+
+
+
+
+**Meta final:** 100% winrate + perfects en todos los combates vs ia determinista.

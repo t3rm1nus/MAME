@@ -1,81 +1,133 @@
 -- =============================================================================
--- autoplay_bridge.lua  |  v1.14 |  SF2CE / MAME 0.286  |  29/03/2026
+-- autoplay_bridge.lua  |  v2.3  |  SF2CE / MAME 0.286
 -- =============================================================================
--- CAMBIOS v1.14:
---   · [FIX] PRESS_CONTINUE ahora pulsa "1 Player Start" en lugar de BTN_JAB.
---     En SF2CE la pantalla de CONTINUE no acepta punches — requiere Start P1.
---     Se añaden 3 pulsos espaciados (f=20, f=60, f=100) para mayor fiabilidad.
--- CAMBIOS v1.13 (mantenidos):
---   · Timeout por frames internos (MAX_COMBAT_FRAMES=6400). Sin lectura RAM timer.
---   · timer en state.txt = estimado por frames. timer_raw = RAM diagnóstico.
--- CAMBIOS v1.11 (mantenidos):
---   · ROUND_OVER_WAIT distingue ronda vs game over real por HP.
---   · Double KO → ROUND_OVER_WAIT.
---   · hp_stable >= 10 frames consecutivos anti-falso-positivo.
--- CAMBIOS v1.10 (mantenidos):
---   · WAITING_COMBAT rechaza HP=255 — tope MAX_HP_VALID=144.
+-- CAMBIOS v2.3 respecto a v2.2:
+--   · FIX CRÍTICO: contador `wait_timeout_count` en WAIT_COMBAT.
+--     Si WAIT_COMBAT expira con is_continue=true más de WAIT_TIMEOUT_MAX veces
+--     consecutivas, se fuerza reinicio completo (INSERT_COIN) en lugar de
+--     quedarse en el bucle infinito WAIT_COMBAT ↔ CHAR_CONFIRM.
+--     Causa del bug: tras varios combates, el juego volvía a la pantalla de
+--     título; el bridge seguía mandando JAB en char select inexistente.
+--   · Reset de wait_timeout_count al entrar en IN_COMBAT.
+-- =============================================================================
+-- DISEÑO: FSM event-driven basada en RAM. SIN frame-counts como lógica
+-- principal. Los timeouts solo actúan como safety-net ante cuelgues.
+--
+-- FLUJO INICIAL (una sola vez al arrancar):
+--   BOOTING
+--     -> INSERT_COIN        (al detectar attract/title: p1_hp=0 o p2_hp=0)
+--     -> PRESS_START        (coin insertada, esperar start screen)
+--     -> CHAR_NAVIGATE      (cursor en Ryu, mover 2xRIGHT a Blanka)
+--     -> CHAR_CONFIRM       (JAB para confirmar)
+--     -> IN_COMBAT          (al detectar ambos HP >= MIN_HP estables)
+--
+-- BUCLE COMBATE:
+--   IN_COMBAT
+--     -> ROUND_OVER         (al detectar HP=0 en cualquier jugador)
+--         Si HP resetea (nueva ronda o nuevo rival) -> IN_COMBAT
+--         Si HP no resetea (game over) -> GAME_OVER
+--     -> GAME_OVER
+--         Insertar coin (event-driven: solo 1 coin)
+--         JAB para confirmar Blanka (preseleccionado por SF2CE)
+--         -> IN_COMBAT
 -- =============================================================================
 
-local BRIDGE_VERSION = "autoplay_bridge_v1.14"
-local BASE_DIR       = "C:\\proyectos\\MAME\\"
-local INPUT_FILE     = BASE_DIR .. "mame_input.txt"
-local STATE_FILE     = BASE_DIR .. "state.txt"
-local STATE_TMP      = BASE_DIR .. "state.tmp"
-local VER_FILE       = BASE_DIR .. "bridge_version_0.txt"
+local BRIDGE_VERSION = "autoplay_bridge_v2.3"
+local BASE_DIR = "C:\\proyectos\\MAME\\"
+local DYN_DIR  = BASE_DIR .. "dinamicos\\"
 
-do
-    local f = io.open(VER_FILE, "w")
-    if f then f:write(BRIDGE_VERSION .. "\n"); f:close()
-        print("[ABridge] OK -> " .. VER_FILE)
-    end
+-- ─── INSTANCE ID ─────────────────────────────────────────────────────────────
+local CLAIM_FILE  = DYN_DIR .. "instance_id_claim.txt"
+local INSTANCE_ID = nil
+local _id_resolved = false
+
+local function try_claim_instance_id()
+    local f = io.open(CLAIM_FILE, "r")
+    if not f then return false end
+    local line = f:read("*l"); f:close()
+    if not line or line == "" then return false end
+    local id = tonumber(line); if not id then return false end
+    os.rename(CLAIM_FILE, DYN_DIR .. "instance_id_claimed_" .. id .. ".txt")
+    INSTANCE_ID = id
+    return true
 end
-print("[ABridge] Iniciando " .. BRIDGE_VERSION)
 
--- ── DIRECCIONES RAM ───────────────────────────────────────────────────────────
+local _id_attempts = 0
+local function ensure_instance_id()
+    if _id_resolved then return end
+    _id_attempts = _id_attempts + 1
+    if try_claim_instance_id() then _id_resolved = true; return end
+    if _id_attempts >= 300 then INSTANCE_ID = 0; _id_resolved = true end
+end
+
+ensure_instance_id()
+
+-- ─── PATHS ───────────────────────────────────────────────────────────────────
+local P = {}
+local _ver_written = false
+
+local function refresh_paths()
+    local sid = tostring(INSTANCE_ID or 0)
+    P = {
+        input   = DYN_DIR .. "mame_input_"     .. sid .. ".txt",
+        state   = DYN_DIR .. "state_"          .. sid .. ".txt",
+        state_t = DYN_DIR .. "state_"          .. sid .. ".tmp",
+        ver     = DYN_DIR .. "bridge_version_" .. sid .. ".txt",
+    }
+end
+refresh_paths()
+
+local function write_ver_file()
+    if _ver_written or not _id_resolved then return end
+    local f = io.open(P.ver, "w")
+    if f then f:write(BRIDGE_VERSION .. "\n"); f:close(); _ver_written = true end
+end
+
+-- ─── DIRECCIONES RAM ─────────────────────────────────────────────────────────
 local ADDR = {
-    P1_HP=0xFF83E9, P2_HP=0xFF86E9,
-    P1_SIDE=0xFF83D0,
-    P1_CHAR=0xFF864F, P2_CHAR=0xFF894F,
-    P1_X_H=0xFF917C, P1_X_L=0xFF917D,
-    P2_X_H=0xFF927C, P2_X_L=0xFF927D,
-    P1_STUN=0xFF895A, P2_STUN=0xFF865A, P2_STUN_SPRITE=0xFF8951,
-    P2_CROUCH=0xFF86C4, P2_ANIM=0xFF86C1,
-    P2_Y_VEL_H=0xFF86FC, P2_Y_VEL_L=0xFF86FD,
-    P1_ANIM=0xFF83C1,
-    P1_Y_VEL_H=0xFF83FC,
-    P1_Y_VEL_L=0xFF83FD,
-    PROJ_SLOT=0xFF8E30, PROJ_IMPACT=0xFF8E00,
-    TIMER=0xFF8ACE,  -- NO FIABLE (siempre 0). Solo diagnostico.
+    P1_HP        = 0xFF83E9,
+    P2_HP        = 0xFF86E9,
+    P1_SIDE      = 0xFF83D0,
+    P1_CHAR      = 0xFF864F,
+    P2_CHAR      = 0xFF894F,
+    P1_X_H       = 0xFF917C, P1_X_L = 0xFF917D,
+    P2_X_H       = 0xFF927C, P2_X_L = 0xFF927D,
+    P1_STUN      = 0xFF895A, P2_STUN = 0xFF865A,
+    P2_STUN_SPR  = 0xFF8951,
+    P2_CROUCH    = 0xFF86C4,
+    P2_ANIM      = 0xFF86C1,
+    P2_Y_VEL_H   = 0xFF86FC, P2_Y_VEL_L = 0xFF86FD,
+    P1_ANIM      = 0xFF83C1,
+    P1_Y_VEL_H   = 0xFF83FC, P1_Y_VEL_L = 0xFF83FD,
+    PROJ_SLOT    = 0xFF8E30,
+    PROJ_IMPACT  = 0xFF8E00,
 }
 
-local MAX_COMBAT_FRAMES = 6400
+local MAX_COMBAT_FRAMES = 6400  -- 99s × 60fps + margen
+local MIN_HP            = 100   -- HP mínimo para considerar combate activo
+local HP_ALIVE          = 10    -- HP > este valor = jugador vivo (no KO)
 
--- ── NOMBRES DE BOTONES ────────────────────────────────────────────────────────
+-- ─── HARDWARE INIT ───────────────────────────────────────────────────────────
+local _mem       = nil
+local _mem_ok    = false
+local _fields    = {}
+local _fields_ok = false
+
 local BTN_JAB        = "P1 Jab Punch"
 local BTN_STRONG     = "P1 Strong Punch"
 local BTN_FIERCE     = "P1 Fierce Punch"
 local BTN_SHORT      = "P1 Short Kick"
 local BTN_FORWARD    = "P1 Forward Kick"
 local BTN_ROUNDHOUSE = "P1 Roundhouse Kick"
+local BTN_COIN       = "Coin 1"
+local BTN_START      = "1 Player Start"
 
-local BUTTON_NAMES = {
-    "P1 Up", "P1 Down", "P1 Left", "P1 Right",
+local ALL_BTNS = {
+    "P1 Up","P1 Down","P1 Left","P1 Right",
     BTN_JAB, BTN_STRONG, BTN_FIERCE,
     BTN_SHORT, BTN_FORWARD, BTN_ROUNDHOUSE,
-    "Coin 1", "1 Player Start",
+    BTN_COIN, BTN_START,
 }
-
-local BTN_LABEL = {
-    [1]="UP",[2]="DOWN",[3]="LEFT",[4]="RIGHT",
-    [5]="JAB",[6]="STRONG",[7]="FIERCE",
-    [8]="SHORT",[9]="FORWARD",[10]="RH",
-}
-
--- ── LAZY INIT ─────────────────────────────────────────────────────────────────
-local _mem       = nil
-local _mem_ok    = false
-local _fields    = {}
-local _fields_ok = false
 
 local function try_init()
     if _mem_ok and _fields_ok then return true end
@@ -83,134 +135,124 @@ local function try_init()
         local ok, sp = pcall(function()
             return manager.machine.devices[":maincpu"].spaces["program"]
         end)
-        if ok and sp then _mem = sp; _mem_ok = true
-            print("[ABridge] Memoria CPU lista.")
-        end
+        if ok and sp then _mem = sp; _mem_ok = true end
     end
-    if not _fields_ok then
+    if not _fields_ok and _mem_ok then
         local ok, ports = pcall(function() return manager.machine.ioport.ports end)
         if ok and ports then
-            local all_fields = {}
-            local total = 0
-            for tag, port in pairs(ports) do
-                for fname, field in pairs(port.fields) do
-                    all_fields[fname] = field
-                    total = total + 1
-                end
+            local all = {}
+            for _, port in pairs(ports) do
+                for fname, field in pairs(port.fields) do all[fname] = field end
             end
-            if total > 0 then
-                local found = 0
-                for _, name in ipairs(BUTTON_NAMES) do
-                    if all_fields[name] then
-                        _fields[name] = all_fields[name]
-                        found = found + 1
-                        print("  [OK ] " .. name)
-                    else
-                        print("  [???] " .. name .. " <- NO ENCONTRADO")
-                    end
-                end
-                print(string.format("[ABridge] Campos: %d/%d (de %d totales)",
-                    found, #BUTTON_NAMES, total))
-                _fields_ok = (found >= 10)
+            local found = 0
+            for _, name in ipairs(ALL_BTNS) do
+                if all[name] then _fields[name] = all[name]; found = found + 1 end
             end
+            _fields_ok = (found >= 10)
         end
     end
     return _mem_ok and _fields_ok
 end
 
--- ── SISTEMA DE INPUTS ─────────────────────────────────────────────────────────
+-- ─── INPUT SYSTEM ────────────────────────────────────────────────────────────
 local _held = {}
-local function hold(name)    _held[name] = true end
-local function release(name) _held[name] = nil  end
-local function clear_held()  _held = {}          end
+local function hold(n)    _held[n] = true  end
+local function release(n) _held[n] = nil   end
+local function clear_all() _held = {}      end
 
 local function flush_inputs()
     if not _fields_ok then return end
     for name, field in pairs(_fields) do
-        local val = _held[name] and 1 or 0
-        pcall(function() field:set_value(val) end)
+        pcall(function() field:set_value(_held[name] and 1 or 0) end)
     end
 end
 
--- ── HELPERS RAM ───────────────────────────────────────────────────────────────
+-- ─── RAM HELPERS ─────────────────────────────────────────────────────────────
 local function ru8(a)
-    if not _mem then return 0 end; return _mem:read_u8(a)
+    if not _mem then return 0 end
+    return _mem:read_u8(a)
 end
 local function ru16(ah, al)
     if not _mem then return 0 end
     return (_mem:read_u8(ah) * 256) + _mem:read_u8(al)
 end
 local function rs16(ah, al)
-    local r = ru16(ah, al); return r >= 0x8000 and r-0x10000 or r
+    local r = ru16(ah, al)
+    return r >= 0x8000 and r - 0x10000 or r
 end
 local function bts(b) return b and "true" or "false" end
 
--- ── ESTADO INTERNO ────────────────────────────────────────────────────────────
-local frame_count      = 0
-local sm_state         = "BOOTING"
-local state_frame      = 0
-local last_input       = {0,0,0,0,0,0,0,0,0,0,0,0}
-local boom_active      = false
-local boom_throw_frame = -1
-local prev_p2_anim     = 0
+-- ─── ESTADO INTERNO ──────────────────────────────────────────────────────────
+local frame_count = 0
+
+-- FSM
+local sm_state   = "BOOTING"
+local sm_frame   = 0   -- frames en el estado actual (para safety timeouts)
+
+-- Lectura anterior (para detectar flancos)
+local prev_p1_hp       = 144
+local prev_p2_hp       = 144
 local prev_p2_airborne = false
 local prev_p1_airborne = false
-local BOOM_VEL         = 25
-local MIN_HP           = 100
-local MAX_HP_VALID     = 144
-local hp_stable        = 0
-local HP_STABLE_N      = 10
+local prev_p2_anim     = 0
 
+-- Boom tracking
+local boom_active      = false
+local boom_throw_frame = -1
+local BOOM_VEL         = 25
+
+-- Diagnóstico combate
+local diag_combat_frame  = 0
 local diag_noop_count    = 0
 local diag_action_count  = 0
-local diag_combat_frame  = 0
 local diag_write_ok      = 0
 local diag_write_fail    = 0
 
--- ── TRANSICIÓN ───────────────────────────────────────────────────────────────
-local function transition(s)
-    print(string.format("[F%d] %s -> %s", frame_count, sm_state, s))
-    sm_state    = s
-    state_frame = 0
-    hp_stable   = 0
-    clear_held()
-    if s == "IN_COMBAT" then
+-- Input Python
+local last_input = {0,0,0,0,0,0,0,0,0,0,0,0}
+
+-- ─── TRANSICIÓN FSM ──────────────────────────────────────────────────────────
+local function transition(new_state)
+    print(string.format("[AB v2.3 ID%d F%d] %s -> %s",
+        INSTANCE_ID or 0, frame_count, sm_state, new_state))
+    sm_state  = new_state
+    sm_frame  = 0
+    clear_all()
+    if new_state == "IN_COMBAT" then
+        diag_combat_frame = 0
         diag_noop_count   = 0
         diag_action_count = 0
-        diag_combat_frame = 0
     end
 end
 
--- ── LECTURA INPUT PYTHON ──────────────────────────────────────────────────────
-local function read_python_input()
-    local f = io.open(INPUT_FILE, "r"); if not f then return nil end
-    local l = f:read("*l"); f:close()
-    if not l or l == "" then return nil end
-    local b = {}
-    for v in l:gmatch("([^,]+)") do b[#b+1] = tonumber(v) or 0 end
-    return #b >= 10 and b or nil
-end
-
--- ── LECTURA ESTADO JUEGO ──────────────────────────────────────────────────────
+-- ─── LECTURA ESTADO JUEGO ────────────────────────────────────────────────────
 local function read_game_state()
     if not _mem_ok then
-        return {p1_hp=0,p2_hp=0,p1_x=700,p2_x=700,p1_dir=1,
-                p1_char=0,p2_char=0,timer=99,timer_raw=0,
-                p1_stun=0,p2_stun=0,p2_stunned=false,
-                p2_crouch=false,p2_anim=0,p2_y_vel=0,p2_airborne=false,
-                p1_anim=0,p1_y_vel=0,p1_airborne=false,p1_landing_this_frame=false,
-                boom_active=false,boom_x_est=0.0,boom_incoming=false,
-                boom_slot_active=false,boom_throw_this_frame=false,
-                fk_landing_this_frame=false,frame=frame_count}
+        return {
+            p1_hp=144, p2_hp=144, p1_x=700, p2_x=700, p1_dir=1,
+            p1_char=2, p2_char=0, timer=99,
+            p1_stun=0, p2_stun=0, p2_stunned=false,
+            p2_crouch=false, p2_anim=0, p2_y_vel=0, p2_airborne=false,
+            p1_anim=0, p1_y_vel=0, p1_airborne=false,
+            p1_landing_this_frame=false,
+            boom_active=false, boom_x_est=0.0,
+            boom_incoming=false, boom_slot_active=false,
+            boom_throw_this_frame=false,
+            fk_landing_this_frame=false,
+            frame=frame_count,
+        }
     end
 
-    local p1hp  = ru8(ADDR.P1_HP);    local p2hp  = ru8(ADDR.P2_HP)
-    local p1x   = ru16(ADDR.P1_X_H,   ADDR.P1_X_L)
-    local p2x   = ru16(ADDR.P2_X_H,   ADDR.P2_X_L)
+    local p1hp  = ru8(ADDR.P1_HP)
+    local p2hp  = ru8(ADDR.P2_HP)
+    local p1x   = ru16(ADDR.P1_X_H, ADDR.P1_X_L)
+    local p2x   = ru16(ADDR.P2_X_H, ADDR.P2_X_L)
     local p1dir = (ru8(ADDR.P1_SIDE) == 0) and 1 or 0
-    local p1char= ru8(ADDR.P1_CHAR);  local p2char= ru8(ADDR.P2_CHAR)
-    local p1st  = ru8(ADDR.P1_STUN);  local p2st  = ru8(ADDR.P2_STUN)
-    local p2ss  = ru8(ADDR.P2_STUN_SPRITE)
+    local p1ch  = ru8(ADDR.P1_CHAR)
+    local p2ch  = ru8(ADDR.P2_CHAR)
+    local p1st  = ru8(ADDR.P1_STUN)
+    local p2st  = ru8(ADDR.P2_STUN)
+    local p2ss  = ru8(ADDR.P2_STUN_SPR)
     local p2cr  = (ru8(ADDR.P2_CROUCH) == 0x03)
     local p2an  = ru8(ADDR.P2_ANIM)
     local p2yv  = rs16(ADDR.P2_Y_VEL_H, ADDR.P2_Y_VEL_L)
@@ -218,246 +260,306 @@ local function read_game_state()
     local p1an  = ru8(ADDR.P1_ANIM)
     local p1yv  = rs16(ADDR.P1_Y_VEL_H, ADDR.P1_Y_VEL_L)
     local p1air = (math.abs(p1yv) > 256)
-    local p1land= prev_p1_airborne and not p1air
+    local p1land = (prev_p1_airborne and not p1air)
 
-    local timer_raw = ru8(ADDR.TIMER)
-    local frames_remaining = math.max(0, MAX_COMBAT_FRAMES - diag_combat_frame)
-    local timer_est = math.min(99, math.ceil(frames_remaining / 60))
+    local bsa = (ru8(ADDR.PROJ_SLOT) == 0xA4)
+    local bi  = (ru8(ADDR.PROJ_IMPACT) == 0x98)
 
-    local bsa   = (ru8(ADDR.PROJ_SLOT) == 0xA4)
-    local bi    = (ru8(ADDR.PROJ_IMPACT) == 0x98)
-
+    -- Detectar throw de boom (flanco en tierra con ANIM=0x0C)
     local boom_thr = false
-    if p2an == 0x0C and not p2air and prev_p2_anim ~= 0x0C then
-        if not prev_p2_airborne then
-            boom_thr = true; boom_active = true; boom_throw_frame = frame_count
-        end
+    if p2an == 0x0C and not p2air and prev_p2_anim ~= 0x0C and not prev_p2_airborne then
+        boom_thr        = true
+        boom_active     = true
+        boom_throw_frame = frame_count
     end
-    if boom_active and not bsa then
-        if frame_count - boom_throw_frame > 180 then boom_active = false end
+    if boom_active and not bsa and (frame_count - boom_throw_frame) > 180 then
+        boom_active = false
     end
 
     local bxe = 0.0
     if boom_active and boom_throw_frame >= 0 then
         local fe = frame_count - boom_throw_frame
-        bxe = p2x - fe * BOOM_VEL
-        if bxe < 0 then bxe = 0.0; boom_active = false end
+        bxe = math.max(0, p2x - fe * BOOM_VEL)
+        if bxe <= 0 then boom_active = false end
     end
 
-    local fkl = false
-    if prev_p2_airborne and not p2air then fkl = true; boom_active = false end
-    prev_p2_anim = p2an; prev_p2_airborne = p2air; prev_p1_airborne = p1air
+    -- FK landing (flanco airborne->tierra)
+    local fkl = (prev_p2_airborne and not p2air)
+    if fkl then boom_active = false end
 
-    return {p1_hp=p1hp, p2_hp=p2hp, p1_x=p1x, p2_x=p2x, p1_dir=p1dir,
-            p1_char=p1char, p2_char=p2char,
-            timer=timer_est, timer_raw=timer_raw,
-            p1_stun=p1st, p2_stun=p2st, p2_stunned=(p2ss==0x24),
-            p2_crouch=p2cr, p2_anim=p2an, p2_y_vel=p2yv, p2_airborne=p2air,
-            p1_anim=p1an, p1_y_vel=p1yv, p1_airborne=p1air,
-            p1_landing_this_frame=p1land,
-            boom_active=boom_active, boom_x_est=bxe,
-            boom_incoming=bi, boom_slot_active=bsa,
-            boom_throw_this_frame=boom_thr,
-            fk_landing_this_frame=fkl, frame=frame_count}
+    prev_p2_anim     = p2an
+    prev_p2_airborne = p2air
+    prev_p1_airborne = p1air
+
+    -- Timer estimado por frame interno
+    local frames_rem = math.max(0, MAX_COMBAT_FRAMES - diag_combat_frame)
+    local timer_est  = math.min(99, math.ceil(frames_rem / 60))
+
+    return {
+        p1_hp=p1hp, p2_hp=p2hp, p1_x=p1x, p2_x=p2x, p1_dir=p1dir,
+        p1_char=p1ch, p2_char=p2ch, timer=timer_est,
+        p1_stun=p1st, p2_stun=p2st, p2_stunned=(p2ss==0x24),
+        p2_crouch=p2cr, p2_anim=p2an, p2_y_vel=p2yv, p2_airborne=p2air,
+        p1_anim=p1an,   p1_y_vel=p1yv, p1_airborne=p1air,
+        p1_landing_this_frame=p1land,
+        boom_active=boom_active, boom_x_est=bxe,
+        boom_incoming=bi, boom_slot_active=bsa,
+        boom_throw_this_frame=boom_thr,
+        fk_landing_this_frame=fkl,
+        frame=frame_count,
+    }
 end
 
--- ── SERIALIZACIÓN JSON ────────────────────────────────────────────────────────
-local function float_to_json(v)
+-- ─── SERIALIZACIÓN JSON ──────────────────────────────────────────────────────
+local function fmtf(v)
     local i = math.floor(v)
-    local d = math.floor((v - i) * 10 + 0.5)
-    return string.format("%d.%d", i, d)
+    return string.format("%d.%d", i, math.floor((v-i)*10+0.5))
 end
 
 local function to_json(s)
     return string.format(
         '{"p1_hp":%d,"p2_hp":%d,"p1_x":%d,"p2_x":%d,"p1_dir":%d,'..
-        '"p1_char":%d,"p2_char":%d,"timer":%d,"timer_raw":%d,'..
+        '"p1_char":%d,"p2_char":%d,"timer":%d,'..
         '"p1_stun":%d,"p2_stun":%d,"p2_stunned":%s,'..
-        '"p2_crouch":%s,"p2_anim":%d,"p2_y_vel":%d,'..
-        '"p2_airborne":%s,'..
+        '"p2_crouch":%s,"p2_anim":%d,"p2_y_vel":%d,"p2_airborne":%s,'..
         '"p1_anim":%d,"p1_y_vel":%d,"p1_airborne":%s,"p1_landing_this_frame":%s,'..
         '"boom_active":%s,"boom_x_est":%s,"boom_incoming":%s,'..
         '"boom_slot_active":%s,"boom_throw_this_frame":%s,'..
         '"fk_landing_this_frame":%s,"p2_hitstop":0,'..
         '"in_combat":%s,"frame":%d}',
-        s.p1_hp, s.p2_hp, s.p1_x, s.p2_x, s.p1_dir,
-        s.p1_char, s.p2_char, s.timer, s.timer_raw,
-        s.p1_stun, s.p2_stun, bts(s.p2_stunned),
-        bts(s.p2_crouch), s.p2_anim, s.p2_y_vel,
-        bts(s.p2_airborne),
-        s.p1_anim, s.p1_y_vel, bts(s.p1_airborne), bts(s.p1_landing_this_frame),
-        bts(s.boom_active), float_to_json(s.boom_x_est), bts(s.boom_incoming),
-        bts(s.boom_slot_active), bts(s.boom_throw_this_frame),
+        s.p1_hp,s.p2_hp,s.p1_x,s.p2_x,s.p1_dir,
+        s.p1_char,s.p2_char,s.timer,
+        s.p1_stun,s.p2_stun,bts(s.p2_stunned),
+        bts(s.p2_crouch),s.p2_anim,s.p2_y_vel,bts(s.p2_airborne),
+        s.p1_anim,s.p1_y_vel,bts(s.p1_airborne),bts(s.p1_landing_this_frame),
+        bts(s.boom_active),fmtf(s.boom_x_est),bts(s.boom_incoming),
+        bts(s.boom_slot_active),bts(s.boom_throw_this_frame),
         bts(s.fk_landing_this_frame),
-        bts(sm_state == "IN_COMBAT"),
+        bts(sm_state=="IN_COMBAT"),
         s.frame)
 end
 
 local function write_state(s)
     local json_str = to_json(s) .. "\n"
-    local f = io.open(STATE_TMP, "w")
+    local f = io.open(P.state_t, "w")
     if f then
         f:write(json_str); f:flush(); f:close()
-        local ok = os.rename(STATE_TMP, STATE_FILE)
+        local ok = os.rename(P.state_t, P.state)
         if ok then diag_write_ok = diag_write_ok + 1; return end
     end
-    local f2 = io.open(STATE_FILE, "w")
+    local f2 = io.open(P.state, "w")
     if f2 then
         f2:write(json_str); f2:flush(); f2:close()
         diag_write_ok = diag_write_ok + 1
     else
         diag_write_fail = diag_write_fail + 1
-        if diag_write_fail % 60 == 1 then
-            print(string.format("[ABridge] ERROR write state.txt (fail=%d)", diag_write_fail))
-        end
     end
 end
 
--- ── MÁQUINA DE ESTADOS ────────────────────────────────────────────────────────
-local function tick_menu(p1hp, p2hp, timer_raw)
-    state_frame = state_frame + 1
-    local f = state_frame
+-- ─── INPUT PYTHON ────────────────────────────────────────────────────────────
+local function read_python_input()
+    local f = io.open(P.input, "r"); if not f then return nil end
+    local l = f:read("*l"); f:close()
+    if not l or l == "" then return nil end
+    local b = {}
+    for v in l:gmatch("([^,]+)") do b[#b+1] = tonumber(v) or 0 end
+    return #b >= 10 and b or nil
+end
 
+-- =============================================================================
+-- FSM — MÁQUINA DE ESTADOS
+-- =============================================================================
+
+-- Contadores de estabilidad
+local hp_stable_count = 0
+local HP_STABLE_NEED  = 8
+
+-- Navegación char select
+local char_nav_step   = 0
+local char_nav_frame  = 0
+local is_continue     = false
+
+-- Coin/start
+local coin_inserted   = false
+local start_pressed   = false
+
+-- ROUND_OVER: distinguir nueva ronda vs game over
+local ko_frames       = 0
+local KO_GAME_OVER_N  = 360
+
+local blanka_ko       = false
+
+-- ─── FIX v2.3: contador de timeouts consecutivos en WAIT_COMBAT ───────────────
+-- Si el juego vuelve a la pantalla de título tras un continue fallido,
+-- el bridge se quedaba en el bucle WAIT_COMBAT ↔ CHAR_CONFIRM indefinidamente.
+-- Con este contador, tras WAIT_TIMEOUT_MAX timeouts seguidos forzamos
+-- un reinicio completo (INSERT_COIN), que recupera cualquier situación.
+local wait_timeout_count = 0
+local WAIT_TIMEOUT_MAX   = 3   -- número de timeouts antes de reinicio completo
+
+-- ─── TICK FSM ────────────────────────────────────────────────────────────────
+local function tick_fsm(st)
+    sm_frame = sm_frame + 1
+
+    local p1_alive   = st.p1_hp > HP_ALIVE
+    local p2_alive   = st.p2_hp > HP_ALIVE
+    local both_alive = p1_alive and p2_alive
+
+    -- =========================================================================
     if sm_state == "BOOTING" then
-        if f >= 360 then transition("DISMISS_WARNING") end
+    -- =========================================================================
+        if _mem_ok and _fields_ok then
+            transition("INSERT_COIN")
+        elseif sm_frame >= 600 then
+            sm_frame = 0
+        end
 
-    elseif sm_state == "DISMISS_WARNING" then
-        clear_held()
-        if f % 30 >= 1  and f % 30 <= 5  then hold(BTN_JAB)           end
-        if f % 30 >= 15 and f % 30 <= 19 then hold("1 Player Start")  end
-        if f >= 180 then clear_held(); transition("INSERT_COIN") end
-
+    -- =========================================================================
     elseif sm_state == "INSERT_COIN" then
-        if f == 20 then hold("Coin 1");    print("[ABridge] Pulsando Coin 1")   end
-        if f == 26 then release("Coin 1"); print("[ABridge] Soltando Coin 1")   end
-        if f >= 100 then transition("PRESS_START") end
+    -- =========================================================================
+        if sm_frame == 1 then
+            hold(BTN_COIN)
+            coin_inserted = true
+        elseif sm_frame == 5 then
+            release(BTN_COIN)
+        end
 
+        if sm_frame >= 60 then
+            transition("PRESS_START")
+        end
+
+    -- =========================================================================
     elseif sm_state == "PRESS_START" then
-        if f == 20 then hold("1 Player Start");    print("[ABridge] Pulsando 1 Player Start") end
-        if f == 26 then release("1 Player Start"); print("[ABridge] Soltando 1 Player Start") end
-        if f >= 220 then transition("CHAR_NAVIGATE") end
+    -- =========================================================================
+        if sm_frame % 20 == 1 then
+            hold(BTN_START)
+        elseif sm_frame % 20 == 6 then
+            release(BTN_START)
+        end
 
+        if sm_frame >= 120 then
+            is_continue   = false
+            char_nav_step = 0
+            char_nav_frame = 0
+            transition("CHAR_NAVIGATE")
+        end
+
+    -- =========================================================================
     elseif sm_state == "CHAR_NAVIGATE" then
-        if f == 10 then hold("P1 Right");   print("[ABridge] RIGHT 1") end
-        if f == 16 then release("P1 Right") end
-        if f == 40 then hold("P1 Right");   print("[ABridge] RIGHT 2") end
-        if f == 46 then release("P1 Right") end
-        if f >= 90 then transition("CHAR_CONFIRM") end
+    -- =========================================================================
+        if is_continue then
+            transition("CHAR_CONFIRM")
+            return
+        end
 
+        char_nav_frame = char_nav_frame + 1
+
+        if char_nav_step == 0 then
+            if char_nav_frame >= 20 then
+                char_nav_step  = 1
+                char_nav_frame = 0
+            end
+
+        elseif char_nav_step == 1 then
+            if char_nav_frame <= 8 then
+                hold("P1 Right")
+            else
+                release("P1 Right")
+                if char_nav_frame >= 20 then
+                    char_nav_step  = 2
+                    char_nav_frame = 0
+                end
+            end
+
+        elseif char_nav_step == 2 then
+            if char_nav_frame <= 8 then
+                hold("P1 Right")
+            else
+                release("P1 Right")
+                if char_nav_frame >= 20 then
+                    char_nav_step  = 3
+                    char_nav_frame = 0
+                end
+            end
+
+        elseif char_nav_step == 3 then
+            transition("CHAR_CONFIRM")
+        end
+
+        if sm_frame >= 500 then
+            print("[AB v2.3] TIMEOUT CHAR_NAVIGATE -> reintento INSERT_COIN")
+            char_nav_step = 0; char_nav_frame = 0
+            transition("INSERT_COIN")
+        end
+
+    -- =========================================================================
     elseif sm_state == "CHAR_CONFIRM" then
-        if f == 10 then hold(BTN_JAB);    print("[ABridge] JAB confirm (Blanka)") end
-        if f == 16 then release(BTN_JAB) end
-        if f >= 450 then transition("WAITING_COMBAT") end
-
-    elseif sm_state == "WAITING_COMBAT" then
-        local p1_valid = (p1hp >= MIN_HP and p1hp <= MAX_HP_VALID)
-        local p2_valid = (p2hp >= MIN_HP and p2hp <= MAX_HP_VALID)
-        if p1_valid and p2_valid then
-            hp_stable = hp_stable + 1
-            if hp_stable >= HP_STABLE_N then transition("IN_COMBAT") end
-        else
-            hp_stable = 0
-        end
-        if f >= 2400 then
-            print("[ABridge] TIMEOUT WAITING_COMBAT - reiniciando flujo")
-            transition("DISMISS_WARNING")
+    -- =========================================================================
+        if sm_frame == 10 then
+            hold(BTN_JAB)
+        elseif sm_frame == 20 then
+            release(BTN_JAB)
         end
 
-    elseif sm_state == "ROUND_OVER_WAIT" then
-        local p1_valid = (p1hp >= MIN_HP and p1hp <= MAX_HP_VALID)
-        local p2_valid = (p2hp >= MIN_HP and p2hp <= MAX_HP_VALID)
-        if p1_valid and p2_valid then
-            hp_stable = hp_stable + 1
-            if hp_stable >= HP_STABLE_N then
-                print(string.format(
-                    "[F%d] ROUND_OVER_WAIT: HP restaurados (P1=%d P2=%d) → siguiente ronda",
-                    frame_count, p1hp, p2hp))
-                transition("WAITING_COMBAT")
+        if sm_frame >= 40 then
+            hp_stable_count = 0
+            transition("WAIT_COMBAT")
+        end
+
+    -- =========================================================================
+    elseif sm_state == "WAIT_COMBAT" then
+    -- =========================================================================
+        if both_alive then
+            hp_stable_count = hp_stable_count + 1
+            if hp_stable_count >= HP_STABLE_NEED then
+                hp_stable_count  = 0
+                wait_timeout_count = 0   -- reset: combate arrancó OK
+                transition("IN_COMBAT")
             end
         else
-            hp_stable = 0
-        end
-        if f >= 360 then
-            print(string.format(
-                "[F%d] ROUND_OVER_WAIT timeout: HP no restaurados → GAME OVER real",
-                frame_count))
-            transition("GAME_OVER_WAIT")
+            hp_stable_count = 0
         end
 
-    elseif sm_state == "GAME_OVER_WAIT" then
-        if f == 60  then hold("Coin 1");   print("[ABridge] Coin antes de CONTINUE") end
-        if f == 66  then release("Coin 1") end
-        if f >= 180 then transition("PRESS_CONTINUE") end
+        -- Safety timeout con lógica anti-bucle (FIX v2.3)
+        if sm_frame >= 1200 then
+            wait_timeout_count = wait_timeout_count + 1
+            print(string.format("[AB v2.3] TIMEOUT WAIT_COMBAT #%d/%d (is_continue=%s)",
+                wait_timeout_count, WAIT_TIMEOUT_MAX, bts(is_continue)))
+            hp_stable_count = 0
 
-    -- ── [v1.14] FIX CRÍTICO: PRESS_CONTINUE ──────────────────────────────────
-    -- SF2CE requiere "1 Player Start" en la pantalla de continue, no BTN_JAB.
-    -- 3 pulsos espaciados: cubre variaciones en el timing de aparición
-    -- de la pantalla de continue vs el momento de transición del estado.
-    elseif sm_state == "PRESS_CONTINUE" then
-        if f == 20  then hold("1 Player Start");   print("[ABridge] CONTINUE (Start) — pulso 1") end
-        if f == 26  then release("1 Player Start") end
-        if f == 60  then hold("1 Player Start");   print("[ABridge] CONTINUE (Start) — pulso 2") end
-        if f == 66  then release("1 Player Start") end
-        if f == 100 then hold("1 Player Start");   print("[ABridge] CONTINUE (Start) — pulso 3") end
-        if f == 106 then release("1 Player Start") end
-        if f >= 310 then transition("WAITING_COMBAT") end
-    end
-end
-
--- ── BUCLE PRINCIPAL ───────────────────────────────────────────────────────────
-local function on_frame()
-    frame_count = frame_count + 1
-
-    if not try_init() then
-        if frame_count % 60 == 0 then
-            print(string.format("[F%d] Esperando máquina MAME... mem=%s fields=%s",
-                frame_count, tostring(_mem_ok), tostring(_fields_ok)))
+            if is_continue and wait_timeout_count < WAIT_TIMEOUT_MAX then
+                -- Todavía hay margen: reintentar solo el JAB de confirmación
+                transition("CHAR_CONFIRM")
+            else
+                -- Demasiados timeouts consecutivos O no es continue:
+                -- el juego probablemente volvió a la pantalla de título.
+                -- Forzar reinicio completo desde INSERT_COIN.
+                print(string.format(
+                    "[AB v2.3] REINICIO COMPLETO (timeouts=%d, is_continue=%s) -> INSERT_COIN",
+                    wait_timeout_count, bts(is_continue)))
+                wait_timeout_count = 0
+                is_continue        = false
+                char_nav_step      = 0
+                char_nav_frame     = 0
+                transition("INSERT_COIN")
+            end
         end
-        write_state(read_game_state())
-        flush_inputs()
-        return
-    end
 
-    local st = read_game_state()
-    write_state(st)
-
-    if sm_state == "IN_COMBAT" then
+    -- =========================================================================
+    elseif sm_state == "IN_COMBAT" then
+    -- =========================================================================
         diag_combat_frame = diag_combat_frame + 1
 
         local buttons = read_python_input()
         if buttons then
             last_input = buttons
-            local any_active = false
-            local active_names = {}
-            for i = 1, 10 do
-                if (buttons[i] or 0) ~= 0 then
-                    any_active = true
-                    active_names[#active_names+1] = (BTN_LABEL[i] or "b"..i)
-                end
-            end
-            if any_active then
-                diag_action_count = diag_action_count + 1
-                if diag_action_count <= 20 then
-                    print(string.format("[INPUT-DIAG] F%d acción#%d: [%s]",
-                        frame_count, diag_action_count,
-                        table.concat(active_names, "+")))
-                end
-            else
-                diag_noop_count = diag_noop_count + 1
-            end
+            local any = false
+            for i = 1,10 do if (buttons[i] or 0) ~= 0 then any = true end end
+            if any then diag_action_count = diag_action_count + 1
+            else diag_noop_count = diag_noop_count + 1 end
         end
 
-        if diag_combat_frame % 600 == 0 then
-            local total = diag_noop_count + diag_action_count
-            local pct   = total > 0 and (diag_action_count * 100 / total) or 0
-            print(string.format(
-                "[DIAG] F%d | cf=%d/%d | NOOPs=%d Acc=%d (%.1f%%) | W_OK=%d W_FAIL=%d",
-                frame_count, diag_combat_frame, MAX_COMBAT_FRAMES,
-                diag_noop_count, diag_action_count, pct,
-                diag_write_ok, diag_write_fail))
-        end
-
-        clear_held()
+        clear_all()
         local b = last_input
         if (b[1]  or 0)~=0 then hold("P1 Up")       end
         if (b[2]  or 0)~=0 then hold("P1 Down")      end
@@ -470,79 +572,127 @@ local function on_frame()
         if (b[9]  or 0)~=0 then hold(BTN_FORWARD)    end
         if (b[10] or 0)~=0 then hold(BTN_ROUNDHOUSE) end
 
-        -- ── DETECCIÓN FIN DE RONDA ───────────────────────────────────────────
-        local p1_dead = (st.p1_hp <= 0)
-        local p2_dead = (st.p2_hp <= 0)
+        local p1_dead = (st.p1_hp <= HP_ALIVE)
+        local p2_dead = (st.p2_hp <= HP_ALIVE)
         local timeout = (diag_combat_frame >= MAX_COMBAT_FRAMES)
 
-        if p2_dead and not p1_dead then
-            clear_held()
-            print(string.format(
-                "[DIAG] FIN-RONDA VICTORIA | P1=%d P2=%d | cf=%d NOOPs=%d Acc=%d",
-                st.p1_hp, st.p2_hp, diag_combat_frame,
-                diag_noop_count, diag_action_count))
-            transition("ROUND_OVER_WAIT")
-
-        elseif p1_dead then
-            clear_held()
-            local tag = p2_dead and "DOUBLE KO" or "DERROTA"
-            print(string.format(
-                "[DIAG] FIN-RONDA %s | P1=%d P2=%d | cf=%d NOOPs=%d Acc=%d",
-                tag, st.p1_hp, st.p2_hp, diag_combat_frame,
-                diag_noop_count, diag_action_count))
-            transition("ROUND_OVER_WAIT")
-
-        elseif timeout then
-            clear_held()
-            local tag = (st.p1_hp > st.p2_hp) and "TIMEOUT VICTORIA" or "TIMEOUT DERROTA"
-            print(string.format(
-                "[DIAG] %s | P1=%d P2=%d | cf=%d/%d | timer_raw=0x%02X",
-                tag, st.p1_hp, st.p2_hp,
-                diag_combat_frame, MAX_COMBAT_FRAMES, st.timer_raw))
-            transition("ROUND_OVER_WAIT")
+        if p1_dead or p2_dead or timeout then
+            clear_all()
+            blanka_ko = p1_dead
+            ko_frames = 0
+            if timeout then
+                print(string.format("[AB v2.3] TIMEOUT COMBATE | P1=%d P2=%d",
+                    st.p1_hp, st.p2_hp))
+                blanka_ko = (st.p1_hp <= st.p2_hp)
+            else
+                print(string.format("[AB v2.3] KO DETECTADO | P1=%d P2=%d blanka_ko=%s",
+                    st.p1_hp, st.p2_hp, bts(p1_dead)))
+            end
+            transition("ROUND_OVER")
         end
 
-        if diag_combat_frame % 300 == 0 then
-            local fk = "tierra"
-            if st.p2_airborne then
-                local a = st.p2_anim
-                if     a == 0x02 then fk = "FK_ASCENSO"
-                elseif a == 0x00 then fk = "FK_CIMA"
-                elseif a == 0x04 then fk = "FK_DESCENSO"
-                elseif a == 0x0C then fk = "FK_STARTUP" end
-            elseif st.p2_anim == 0x0C then fk = "BOOM/FK_LAND" end
-            print(string.format(
-                "[F%d] P1=%d P2=%d X:%d-%d ANIM=0x%02X(%s) Y=%d | "..
-                "TMR_EST=%ds TMR_RAW=0x%02X | cf=%d/%d | BOOM:%s",
-                frame_count, st.p1_hp, st.p2_hp, st.p1_x, st.p2_x,
-                st.p2_anim, fk, st.p2_y_vel,
-                st.timer, st.timer_raw,
-                diag_combat_frame, MAX_COMBAT_FRAMES,
-                tostring(st.boom_active)))
+    -- =========================================================================
+    elseif sm_state == "ROUND_OVER" then
+    -- =========================================================================
+        local p1_rising = (prev_p1_hp <= HP_ALIVE and st.p1_hp >= MIN_HP)
+        local p2_rising = (prev_p2_hp <= HP_ALIVE and st.p2_hp >= MIN_HP)
+        local hp_flank  = p1_rising and p2_rising
+
+        if hp_flank then
+            hp_stable_count = hp_stable_count + 1
+            if hp_stable_count >= 3 then
+                hp_stable_count = 0
+                ko_frames = 0
+                print("[AB v2.3] HP RESET (flanco) -> nueva ronda / nuevo rival")
+                transition("IN_COMBAT")
+            end
+        elseif both_alive then
+            hp_stable_count = hp_stable_count + 1
+            if hp_stable_count >= HP_STABLE_NEED then
+                hp_stable_count = 0
+                ko_frames = 0
+                print("[AB v2.3] HP RESET (estable) -> nueva ronda / nuevo rival")
+                transition("IN_COMBAT")
+            end
+        else
+            hp_stable_count = 0
         end
 
-    else
-        tick_menu(st.p1_hp, st.p2_hp, st.timer_raw)
-        if frame_count % 120 == 0 then
-            local held_str = ""
-            for k, _ in pairs(_held) do held_str = held_str .. k .. " " end
-            if held_str == "" then held_str = "(ninguno)" end
-            print(string.format(
-                "[F%d] STATE=%-22s f=%d HP=%d/%d TMR_EST=%d TMR_RAW=0x%02X HELD:[%s]",
-                frame_count, sm_state, state_frame,
-                st.p1_hp, st.p2_hp, st.timer, st.timer_raw, held_str))
+        local any_hp_rising = (st.p1_hp > prev_p1_hp or st.p2_hp > prev_p2_hp)
+        if any_hp_rising then
+            ko_frames = 0
+        else
+            ko_frames = ko_frames + 1
+            if ko_frames >= KO_GAME_OVER_N then
+                print("[AB v2.3] GAME OVER detectado (HP sin recuperar en " ..
+                    KO_GAME_OVER_N .. " frames)")
+                ko_frames = 0; hp_stable_count = 0
+                transition("GAME_OVER")
+            end
+        end
+
+        if sm_frame >= 4000 then
+            print("[AB v2.3] TIMEOUT ROUND_OVER (4000f) -> forzar GAME_OVER")
+            ko_frames = 0; hp_stable_count = 0
+            transition("GAME_OVER")
+        end
+
+    -- =========================================================================
+    elseif sm_state == "GAME_OVER" then
+    -- =========================================================================
+        if sm_frame == 1 then
+            hold(BTN_COIN)
+        elseif sm_frame == 5 then
+            release(BTN_COIN)
+        end
+
+        if sm_frame >= 10 and sm_frame % 15 == 0 then
+            hold(BTN_START)
+        elseif sm_frame >= 10 and sm_frame % 15 == 5 then
+            release(BTN_START)
+        end
+
+        if sm_frame >= 120 then
+            is_continue     = true
+            hp_stable_count = 0
+            transition("CHAR_CONFIRM")
         end
     end
+end
+
+-- =============================================================================
+-- BUCLE PRINCIPAL
+-- =============================================================================
+local function on_frame()
+    frame_count = frame_count + 1
+
+    if not _id_resolved then
+        ensure_instance_id()
+        if _id_resolved then refresh_paths(); write_ver_file() end
+    end
+    if not _ver_written then write_ver_file() end
+
+    try_init()
+
+    local st = read_game_state()
+
+    write_state(st)
+
+    tick_fsm(st)
+
+    prev_p1_hp = st.p1_hp
+    prev_p2_hp = st.p2_hp
 
     flush_inputs()
+
+    if frame_count % 600 == 0 then
+        print(string.format("[AB v2.3 ID%d] estado=%s smf=%d P1HP=%d P2HP=%d wr=%d cont=%s wt=%d",
+            INSTANCE_ID or 0, sm_state, sm_frame, st.p1_hp, st.p2_hp,
+            diag_write_ok, bts(is_continue), wait_timeout_count))
+    end
 end
 
 emu.register_frame_done(on_frame, "frame")
 
-print("[ABridge] Bridge activo v1.14")
-print("  [v1.14] FIX: PRESS_CONTINUE usa '1 Player Start' (3 pulsos f=20/60/100)")
-print("  [v1.13] Timeout por frames internos — MAX_COMBAT_FRAMES=" .. MAX_COMBAT_FRAMES)
-print("  [v1.13] timer en state.txt = estimado por frames (timer_raw = RAM diagnostico)")
-print("  [v1.11] ROUND_OVER_WAIT distingue ronda vs game over real")
-print("  -> " .. INPUT_FILE)
-print("  -> " .. STATE_FILE)
+print("[AB v2.3] Iniciado - FSM event-driven, sin tiempos hardcodeados")
+print("[AB v2.3] FIX: anti-bucle WAIT_COMBAT (max " .. WAIT_TIMEOUT_MAX .. " timeouts -> INSERT_COIN)")
