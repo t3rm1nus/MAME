@@ -14,6 +14,13 @@ import json
 
 # ==================== DIRECCIONES RAM — ORO PURO (NO MODIFICAR) ==============
 
+
+# ==================== DIRECCIONES RAM — ESTADO MAESTRO =======================
+# Encontrado vía scanner_fsm.py el 31/03/2026
+GAME_STATE_ADDR = 0xFF8005
+def get_game_state(ram_reader) -> int:
+    return ram_reader.read_u8(GAME_STATE_ADDR)
+
 # --- VIDA ---
 P1_HP_ADDR     = 0xFF83E9
 P2_HP_ADDR     = 0xFF86E9

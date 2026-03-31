@@ -1,23 +1,24 @@
 """
 blanka_env.py — Entorno Gymnasium Blanka vs Arcade (SF2CE / MAME 0.286)
 ========================================================================
-Version: 4.4 (30/03/2026) - FIXES OUT-OF-COMBAT + ROUND TRACKING
+Version: 4.6 (31/03/2026) — Fix crítico step() + tracking mejor-de-3
 
-CAMBIOS v4.4 respecto a v4.3:
-  · [FIX CRÍTICO] Eliminada truncación por MENU_FRAMES_MAX.
-    La única causa de truncated es MAX_STEPS. Los frames fuera de combate
-    (menú, continue, char select) son parte normal del flujo y NO deben
-    terminar el episodio. A velocidad de entrenamiento MENU_FRAMES_MAX=1200
-    se dispara en milisegundos.
-  · [FIX] `ep_rounds_played` ya no se inicializa a 1 en reset. Se incrementa
-    solo cuando se detecta un inicio real de ronda (ambos HP >= EPISODE_MIN_HP
-    tras haber estado bajos), incluyendo el primer combate del reset.
-  · [FIX] `ep_matches_played` inicializado a 0 en reset; se incrementa al
-    detectar el primer combate (en reset) y en cada cambio de rival.
-  · [FIX] `_cl1_action` usa el estado actual del step (pasado como argumento),
-    no `self.bridge._last_state` (estado desfasado).
-  · [LIMPIEZA] `_out_of_combat_frames` ya no se usa para truncar; se mantiene
-    solo como métrica diagnóstica en el info dict.
+BUGS CORREGIDOS vs v4.5:
+  · [CRÍTICO] `r += 60.0` se ejecutaba ANTES de `r = self._calc_reward()`
+    → NameError en cada ronda ganada. Fix: r=0.0 inicializado al principio
+    de step(); las bonificaciones de ronda se acumulan antes de _calc_reward,
+    que las suma al total.
+  · [CRÍTICO] `p2_just_died` usado en el return final sin haber sido definido
+    → NameError. Fix: definido al inicio del bloque en-combate.
+  · [BUG] `just_entered_combat` definido dos veces; la segunda siempre False
+    porque self._prev_in_combat ya se había fijado a True. Fix: una sola
+    definición, usada correctamente.
+  · [BUG] `_round_processed` nunca se reseteaba (la lógica de reset dependía
+    del `just_entered_combat` roto). Fix: se resetea cuando round_result=="none".
+  · [BUG] Tracking mejor-de-3 era heurístico e incompleto. Fix: se leen
+    directamente los campos `match_p1_wins`, `match_p2_wins` y `match_over`
+    que el Lua v2.6 publica en el JSON. Python NO infiere nada: es el Lua
+    la fuente de verdad del marcador.
 
 INVARIANTE CLAVE (mantenido desde v4.0):
   · El episodio NO termina al perder una ronda ni al ganar un rival.
@@ -25,16 +26,8 @@ INVARIANTE CLAVE (mantenido desde v4.0):
       (a) Arcade clear (Bison derrotado)   → terminated=True
       (b) Truncation por MAX_STEPS         → truncated=True
 
-MÉTRICAS PARA TENSORBOARD (extraer del info dict):
-  Durante el episodio:
-    info["round_won_this_step"]  → bool — loguear como evento puntual
-    info["match_won_this_step"]  → bool — loguear como evento puntual
-  Al final del episodio (cuando terminated o truncated):
-    info["ep_round_wins"]        → int   — rondas ganadas en el episodio
-    info["ep_match_wins"]        → int   — enfrentamientos ganados en el episodio
-    info["ep_rounds_played"]     → int   — rondas disputadas en el episodio
-    info["ep_round_win_rate"]    → float — ep_round_wins / max(ep_rounds_played, 1)
-    info["ep_match_win_rate"]    → float — ep_match_wins / max(ep_matches_played, 1)
+NUEVO CAMPO `match_bonus_reward` en _calc_reward:
+  · Recompensa parcial de +25 por victoria de match (complementa el KO reward).
 """
 
 import os, time, sys
@@ -51,14 +44,14 @@ from mame_bridge import MAMEBridge
 from core.rival_registry import RivalRegistry
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
-ROLLING_AND_ELECTRIC_ONLY: bool = False
+ROLLING_AND_ELECTRIC_ONLY: bool = False   # v4.5+: siempre False
 
 # ── CONSTANTES ───────────────────────────────────────────────────────────────
 MAX_HP            = 144.0
 MAX_X             = 1400.0
 STUN_MAX          = 200.0
 TIMER_MAX         = 99.0
-EPISODE_MIN_HP    = 100   # HP mínimo para considerar combate activo
+EPISODE_MIN_HP    = 100
 CHARGE_REQUIRED   = 68
 BOOM_FLIGHT_STEPS = 51
 FK_YVEL_THR       = 256
@@ -150,7 +143,6 @@ MACRO_JUMP_BACK_FORWARD: List[List[int]] = (
 )
 MACRO_ROLLING_JUMP: List[List[int]] = [[0,0,0,1,0,0,1,0,0,0,0,0]]
 
-# ── TABLA DE MACROS ──────────────────────────────────────────────────────────
 MACROS: Dict[int, List[List[int]]] = {
     15: MACRO_ROLLING_FIERCE,
     16: MACRO_ROLLING_STRONG,
@@ -185,7 +177,7 @@ def fk_phase_value(anim: int, p2_airborne: bool) -> float:
 class BlankaEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
 
-    def __init__(self, instance_id: int = 0, max_steps: int = 30000,
+    def __init__(self, instance_id: int = 0, max_steps: int = 50_000,
                  render_mode=None, registry: Optional[RivalRegistry] = None):
         super().__init__()
         self.instance_id = instance_id
@@ -229,33 +221,33 @@ class BlankaEnv(gym.Env):
         self._rolling_hits:   int = 0
         self._electric_count: int = 0
         self._electric_hits:  int = 0
-
         self._arcade_rival_seq: List[int] = []
         self._reached_bonus:    bool  = False
         self._bonus_frames:     int   = 0
         self._prev_rival:       int   = 0xFF
         self._ep_wins:          int   = 0
-
-        self._out_of_combat_frames: int   = 0  # diagnóstico (no trunca)
+        self._out_of_combat_frames: int   = 0
         self._combat_p1_dmg:       float  = 0.0
         self._combat_p2_dmg:       float  = 0.0
         self._combat_won:          bool   = False
         self._combat_timeout_win:  bool   = False
         self._rivals_defeated:     int    = 0
-
         self._bosses_reached:    Set[int] = set()
         self._arcade_cleared:    bool     = False
         self._arcade_just_cleared: bool   = False
-
-        # v4.3: tracking de rondas y enfrentamientos
         self._ep_round_wins:    int = 0
         self._ep_match_wins:    int = 0
         self._ep_rounds_played: int = 0
         self._ep_matches_played: int = 0
-
-        # v4.4: HP previo para detectar inicio de ronda
         self._prev_in_combat:   bool  = False
         self._first_combat_seen: bool = False
+
+        # v4.6: tracking mejor-de-3 leído del Lua
+        self._round_processed:    bool = False  # evita procesar mismo resultado varias veces
+        self._prev_match_p1_wins: int  = 0      # marcador Lua del frame anterior
+        self._prev_match_p2_wins: int  = 0
+        # Reward acumulada de rondas ganadas (se suma en _calc_reward)
+        self._round_bonus_pending: float = 0.0
 
     # ── OBSERVACIÓN ──────────────────────────────────────────────────────────
     def _get_obs(self, st: Optional[Dict]) -> np.ndarray:
@@ -308,7 +300,13 @@ class BlankaEnv(gym.Env):
         return np.clip(obs, -1.0, 1.0)
 
     # ── REWARD ───────────────────────────────────────────────────────────────
-    def _calc_reward(self, p1hp: float, p2hp: float, st: Dict, action: int) -> float:
+    def _calc_reward(self, p1hp: float, p2hp: float, st: Dict, action: int,
+                     extra_bonus: float = 0.0) -> float:
+        """
+        Calcula la recompensa del step.
+        extra_bonus: recompensas adicionales (victoria de ronda/match) que se
+                     calculan ANTES de esta función y se suman aquí.
+        """
         dp1 = max(0.0, self._prev_p1_hp - p1hp)
         dp2 = max(0.0, self._prev_p2_hp - p2hp)
 
@@ -317,13 +315,13 @@ class BlankaEnv(gym.Env):
         p1a  = bool(st.get("p1_airborne", False))
         dist = abs(p1x - p2x)
 
-        r = 0.0
+        r = extra_bonus  # Incluye bonificaciones de ronda/match ya calculadas
 
-        # Daño básico
+        # ── Daño básico ──────────────────────────────────────────────────────
         r += dp2 * 8.0
         r -= dp1 * 12.0
 
-        # Remate
+        # ── Remate ───────────────────────────────────────────────────────────
         if p2hp <= 0 and dp2 > 0:
             r += 60.0
         elif p2hp < 40 and dp2 > 0:
@@ -331,7 +329,7 @@ class BlankaEnv(gym.Env):
         elif p2hp < 70 and dp2 > 0:
             r += 8.0
 
-        # Rolling Attack
+        # ── Rolling Attack ───────────────────────────────────────────────────
         if action in ROLLING_ACTIONS:
             in_fk_window = 0 < self._fk_land_steps <= 20
             good_dist    = 180 <= dist <= 650
@@ -342,27 +340,29 @@ class BlankaEnv(gym.Env):
             else:
                 r -= 1.5 if dist < 150 or dist > 720 else 0.8
 
-        # Electricidad
+        # ── Electricidad ─────────────────────────────────────────────────────
         if action == ACTION_ELECTRIC:
             if dp2 > 0:
                 r += 14.0 if dist < ELECTRIC_MAX_DIST else 7.0
             else:
                 r -= 3.0 if dist > ELECTRIC_MAX_DIST else 1.2
 
-        # Bonus de carga
+        # ── Bonus de carga back (+0.10/step) ─────────────────────────────────
         back = 3 if self._last_p1_dir == 1 else 4
         if action == back or action in (23, 24):
-            r += 0.06
+            r += 0.10
 
-        # Penalización inactividad
-        if self._ep_step > 60 and dp2 == 0 and dp1 == 0:
+        # ── Penalización inactividad ─────────────────────────────────────────
+        dp1_raw = max(0.0, self._prev_p1_hp - p1hp)
+        dp2_raw = max(0.0, self._prev_p2_hp - p2hp)
+        if self._ep_step > 60 and dp2_raw == 0 and dp1_raw == 0:
             r -= 0.003
 
-        # Rival en esquina
+        # ── Rival en esquina ─────────────────────────────────────────────────
         if p2x < 120 or p2x > 1280:
             r += 1.2
 
-        # Rolling Jump
+        # ── Rolling Jump ─────────────────────────────────────────────────────
         if action == 25:
             in_window = self._p1_land_steps > 0 and self._p1_land_steps <= LANDING_WINDOW
             if in_window and dp2 > 0:
@@ -372,7 +372,7 @@ class BlankaEnv(gym.Env):
             else:
                 r -= 4.0
 
-        # Saltos con ataque
+        # ── Saltos con ataque ────────────────────────────────────────────────
         if action in (19, 20, 21, 22, 23, 24):
             if dp2 > 0:
                 r += 7.0
@@ -381,7 +381,7 @@ class BlankaEnv(gym.Env):
             elif p1a and dp1 > 0:
                 r -= 4.0
 
-        # Arcade clear (solo el frame del KO a Bison)
+        # ── Arcade clear ─────────────────────────────────────────────────────
         if self._arcade_just_cleared:
             r += ARCADE_CLEAR_REWARD
             self._arcade_just_cleared = False
@@ -488,7 +488,6 @@ class BlankaEnv(gym.Env):
         self._gnd_steps  = 0 if p2a else min(self._gnd_steps + 1, 60)
         self._last_p1_dir = int(st.get("p1_dir", 1))
 
-        # Tracking de rival y bonus stages
         if cid <= 11:
             if cid != self._prev_rival and self._prev_rival != 0xFF:
                 if cid not in self._arcade_rival_seq:
@@ -514,15 +513,6 @@ class BlankaEnv(gym.Env):
                         f"⭐ BONUS STAGE DETECTADO | step={self._ep_step}"
                     )
                 self._reached_bonus = True
-
-    def _cl1_action(self, st: Optional[Dict]) -> int:
-        """Elige rolling o electricidad según distancia. Usa el estado actual."""
-        if st is None:
-            return ACTION_ROLLING
-        p1x  = float(st.get("p1_x", 700.0))
-        p2x  = float(st.get("p2_x", 700.0))
-        dist = abs(p1x - p2x)
-        return ACTION_ELECTRIC if dist < ELECTRIC_MAX_DIST else ACTION_ROLLING
 
     # ── REGISTRO DE COMBATE ───────────────────────────────────────────────────
     def _flush_combat_to_registry(self, timeout_win: bool = False):
@@ -554,6 +544,7 @@ class BlankaEnv(gym.Env):
         timeout_win: bool, p2_just_died: bool, won: bool,
         round_won_this_step: bool, match_won_this_step: bool,
         in_combat: bool, terminated: bool, truncated: bool,
+        match_p1_wins: int = 0, match_p2_wins: int = 0, match_over: bool = False,
     ) -> Dict:
         ep_done = terminated or truncated
         return {
@@ -571,7 +562,6 @@ class BlankaEnv(gym.Env):
             "rolling_jump":   int(action == 25),
             "p1_land":        self._p1_land_steps,
             "rolling_jump_rdy": int(self._rolling_jump_rdy),
-            "rolling_and_electric_only": ROLLING_AND_ELECTRIC_ONLY,
             "arcade_sequence":      list(self._arcade_rival_seq),
             "reached_bonus":        self._reached_bonus,
             "round_wins":           self._ep_wins,
@@ -583,14 +573,17 @@ class BlankaEnv(gym.Env):
             "bosses_reached_ids":   sorted(list(self._bosses_reached)),
             "arcade_cleared":       self._arcade_cleared,
             "in_combat":            in_combat,
-            # v4.3: win tracking
+            # v4.6: marcador mejor-de-3 desde Lua
+            "match_p1_wins":        match_p1_wins,
+            "match_p2_wins":        match_p2_wins,
+            "match_over":           match_over,
+            # v4.3: win tracking episodio
             "round_won_this_step":  round_won_this_step,
             "match_won_this_step":  match_won_this_step,
             "ep_round_wins":        self._ep_round_wins,
             "ep_match_wins":        self._ep_match_wins,
             "ep_rounds_played":     self._ep_rounds_played,
             "ep_matches_played":    self._ep_matches_played,
-            # Ratios: solo al final de episodio
             "ep_round_win_rate": (
                 self._ep_round_wins / max(self._ep_rounds_played, 1)
                 if ep_done else None
@@ -605,7 +598,6 @@ class BlankaEnv(gym.Env):
     def reset(self, *, seed=None, options=None) -> Tuple[np.ndarray, Dict]:
         super().reset(seed=seed)
 
-        # ── Reset de TODO el estado interno ──────────────────────────────────
         self._prev_p1_hp    = MAX_HP
         self._prev_p2_hp    = MAX_HP
         self._ep_step       = 0
@@ -651,21 +643,18 @@ class BlankaEnv(gym.Env):
         self._arcade_just_cleared= False
         self._prev_in_combat     = False
         self._first_combat_seen  = False
-
-        # v4.4: contadores inicializados a 0 — se incrementan al ver el primer combate
         self._ep_round_wins    = 0
         self._ep_match_wins    = 0
         self._ep_rounds_played = 0
         self._ep_matches_played= 0
+        # v4.6: estado mejor-de-3
+        self._round_processed    = False
+        self._prev_match_p1_wins = 0
+        self._prev_match_p2_wins = 0
+        self._round_bonus_pending = 0.0
 
-        print(
-            f"[BlankaEnv#{self.instance_id}] Reset..."
-            + (" [ROLLING_AND_ELECTRIC_ONLY]" if ROLLING_AND_ELECTRIC_ONLY else "")
-        )
+        print(f"[BlankaEnv#{self.instance_id}] Reset... [ESPACIO COMPLETO — 26 acciones]")
 
-        # Esperar hasta que el bridge nos dé un estado de combate válido.
-        # Sin timeout hardcodeado en términos de frames: esperamos hasta 60s reales.
-        # El bridge (autoplay_bridge.lua v2.0) gestiona toda la navegación.
         st = None
         deadline = time.time() + 60.0
         while time.time() < deadline:
@@ -692,10 +681,10 @@ class BlankaEnv(gym.Env):
         self._current_rival = cid if cid <= 11 else 0xFF
         self._prev_in_combat = True
         self._first_combat_seen = True
-
-        # Primera ronda del episodio
         self._ep_rounds_played  = 1
         self._ep_matches_played = 1
+        self._prev_match_p1_wins = int(st.get("match_p1_wins", 0))
+        self._prev_match_p2_wins = int(st.get("match_p2_wins", 0))
 
         if cid <= 11:
             self._arcade_rival_seq = [cid]
@@ -729,16 +718,13 @@ class BlankaEnv(gym.Env):
             "ep_round_win_rate": None, "ep_match_win_rate": None,
             "round_won_this_step": False, "match_won_this_step": False,
             "out_of_combat_frames": 0, "in_combat": False,
+            "match_p1_wins": 0, "match_p2_wins": 0, "match_over": False,
         }
 
     # ── STEP ─────────────────────────────────────────────────────────────────
     def step(self, action: int):
         self._ep_step += 1
         action = int(action)
-
-        # Modo restricción de acciones
-        if ROLLING_AND_ELECTRIC_ONLY and not self._macro_active:
-            action = self._cl1_action(self.bridge._last_state)
 
         raw_input = self._resolve(action)
         st = self.bridge.step(raw_input)
@@ -760,23 +746,30 @@ class BlankaEnv(gym.Env):
         cid  = int(st.get("p2_char", 0xFF))
         in_combat = bool(st.get("in_combat", False))
 
+        # Marcador mejor-de-3 leído del Lua (fuente de verdad)
+        lua_p1_wins  = int(st.get("match_p1_wins", 0))
+        lua_p2_wins  = int(st.get("match_p2_wins", 0))
+        lua_match_over = bool(st.get("match_over", False))
+
         self._p1_hp_hist.append(self._prev_p1_hp)
         self._p2_hp_hist.append(self._prev_p2_hp)
 
-        # ── FUERA DE COMBATE (menú, continue, char select) ────────────────────
-        # No truncamos. Solo contabilizamos frames de espera y devolvemos r=0.
+        # ── FUERA DE COMBATE ─────────────────────────────────────────────────
         if not in_combat:
             self._out_of_combat_frames += 1
+            # Cuando round_result vuelve a "none" → el Lua inició nueva ronda
+            if st.get("round_result", "none") == "none":
+                self._round_processed = False
             self._prev_in_combat = False
             self._update_internals(st)
-
             truncated  = self._ep_step >= self.MAX_STEPS
-            terminated = False
-            return self._get_obs(st), 0.0, terminated, truncated, self._build_info(
+            return self._get_obs(st), 0.0, False, truncated, self._build_info(
                 p1hp=p1hp, p2hp=p2hp, action=action,
                 timeout_win=False, p2_just_died=False, won=False,
                 round_won_this_step=False, match_won_this_step=False,
-                in_combat=False, terminated=terminated, truncated=truncated,
+                in_combat=False, terminated=False, truncated=truncated,
+                match_p1_wins=lua_p1_wins, match_p2_wins=lua_p2_wins,
+                match_over=lua_match_over,
             )
 
         # ── EN COMBATE ────────────────────────────────────────────────────────
@@ -789,32 +782,82 @@ class BlankaEnv(gym.Env):
         self._combat_p1_dmg += dp1
         self._combat_p2_dmg += dp2
 
-        # v4.3: flags de evento
+        # Variables de resultado del step (inicializadas aquí — [FIX NameError])
+        p2_just_died        = (p2hp <= 0 and dp2 > 0)
+        almost_ko           = (self._combat_p2_dmg >= 130 and p2hp <= 30 and dp2 > 0)
         round_won_this_step  = False
         match_won_this_step  = False
+        extra_reward         = 0.0  # bonificaciones de ronda/match; se suma en _calc_reward
 
-        # ── Detección de transición menú→combate (nueva ronda o nuevo rival) ─
-        # Cuando volvemos de out_of_combat (continue, nueva ronda) y ambos HP
-        # están restaurados, contamos una nueva ronda.
-        just_entered_combat = (not self._prev_in_combat) and in_combat
-        if just_entered_combat and self._first_combat_seen:
-            if p1hp >= EPISODE_MIN_HP and p2hp >= EPISODE_MIN_HP:
-                self._ep_rounds_played += 1
+        # ── TRACKING MEJOR DE 3 (fuente: Lua v2.6) ───────────────────────────
+        # Detectamos cambios en el marcador comparando con el frame anterior.
+        # Esto es 100% preciso: el Lua bloquea el resultado en el frame exacto del KO.
+        round_result = st.get("round_result", "none")
 
-        # ── Detección de nueva ronda en medio del enfrentamiento ──────────────
-        # (sin salida a menú: HP suben mientras ya estábamos en combate)
-        new_round_mid_combat = (
-            self._prev_in_combat and in_combat and
-            self._prev_p1_hp < EPISODE_MIN_HP and p1hp >= EPISODE_MIN_HP and
-            self._prev_p2_hp < EPISODE_MIN_HP and p2hp >= EPISODE_MIN_HP
-        )
-        if new_round_mid_combat:
+        # Cuando round_result vuelve a "none" → nueva ronda comenzó; resetear flag
+        if round_result == "none":
+            self._round_processed = False
+
+        elif not self._round_processed:
+            # Nuevo resultado de ronda — procesar UNA SOLA VEZ
+            self._round_processed = True
             self._ep_rounds_played += 1
 
-        self._prev_in_combat    = True
-        self._first_combat_seen = True
+            if round_result == "win":
+                self._ep_round_wins += 1
+                round_won_this_step  = True
+                extra_reward        += 15.0   # bonus de ronda ganada
+                print(
+                    f"[BlankaEnv#{self.instance_id}] ✅ Round GANADO "
+                    f"| Marcador: P1={lua_p1_wins} P2={lua_p2_wins}"
+                )
+            elif round_result == "loss":
+                print(
+                    f"[BlankaEnv#{self.instance_id}] ❌ Round PERDIDO "
+                    f"| Marcador: P1={lua_p1_wins} P2={lua_p2_wins}"
+                )
+            elif round_result == "draw":
+                print(f"[BlankaEnv#{self.instance_id}] 🤝 Double KO (draw)")
 
-        # ── Cambio de rival (match win) ───────────────────────────────────────
+            # ¿Terminó el enfrentamiento? (alguien llega a 2 victorias)
+            if lua_match_over:
+                p1_won_match = lua_p1_wins >= 2
+                self._ep_matches_played += 1
+
+                if p1_won_match:
+                    self._ep_match_wins    += 1
+                    self._combat_won        = True
+                    self._rivals_defeated  += 1
+                    self._ep_wins          += 1
+                    match_won_this_step     = True
+                    extra_reward           += 25.0   # bonus extra por ganar el match
+                    rname = CHAR_NAMES.get(cid, f"ID_{cid}")
+                    print(
+                        f"[BlankaEnv#{self.instance_id}] 🏆 MATCH GANADO "
+                        f"vs {rname} "
+                        f"| 2-{lua_p2_wins}"
+                        + (" [BOSS]" if cid in BOSS_IDS else "")
+                    )
+                    # ¿Arcade clear?
+                    if cid == ARCADE_FINAL_BOSS and not self._arcade_cleared:
+                        self._arcade_cleared     = True
+                        self._arcade_just_cleared = True
+                        print(f"[BlankaEnv#{self.instance_id}] 🎮 *** ARCADE CLEARED *** 🎮")
+                else:
+                    rname = CHAR_NAMES.get(cid, f"ID_{cid}")
+                    print(
+                        f"[BlankaEnv#{self.instance_id}] 💀 MATCH PERDIDO "
+                        f"vs {rname} "
+                        f"| {lua_p1_wins}-2 | Esperando Continue..."
+                    )
+
+                self._flush_combat_to_registry(timeout_win=False)
+
+        # Actualizar marcador previo
+        self._prev_match_p1_wins = lua_p1_wins
+        self._prev_match_p2_wins = lua_p2_wins
+
+        # ── Cambio de rival en mid-combat (seguridad adicional) ───────────────
         rival_changed = (cid <= 11 and
                          cid != self._current_rival and
                          self._current_rival <= 11)
@@ -824,45 +867,11 @@ class BlankaEnv(gym.Env):
                 f"{CHAR_NAMES.get(self._current_rival,'?')} → {CHAR_NAMES.get(cid,'?')}"
                 + (" [BOSS]" if cid in BOSS_IDS else "")
             )
-            self._combat_won   = True
-            self._rivals_defeated += 1
-            self._flush_combat_to_registry(timeout_win=False)
-            self._ep_wins     += 1
-            self._won_round    = True
-
-            self._ep_match_wins     += 1
-            match_won_this_step      = True
-            self._ep_matches_played += 1
-            self._ep_rounds_played  += 1  # nuevo rival = nueva ronda
+            # El marcador se resetea en el Lua; aquí solo actualizamos estado local
+            self._round_processed = False   # nueva ronda con nuevo rival
 
         self._update_internals(st)
-
-        # ── KO de P2 ─────────────────────────────────────────────────────────
-        p2_just_died = (p2hp <= 0 and self._prev_p2_hp > 0 and p1hp > 0)
-        almost_ko    = (self._combat_p2_dmg >= 130 and p2hp <= 30 and dp2 > 0)
-
-        if p2_just_died:
-            self._ep_round_wins  += 1
-            round_won_this_step   = True
-
-        if p2_just_died or almost_ko:
-            if not self._combat_won:
-                print(
-                    f"[BlankaEnv#{self.instance_id}] ¡KO! "
-                    f"(dmg_total={self._combat_p2_dmg:.1f} | p2hp={p2hp:.1f})"
-                )
-                self._combat_won = True
-
-            # ¿Arcade clear?
-            if (p2_just_died and
-                    self._current_rival == ARCADE_FINAL_BOSS and
-                    not self._arcade_cleared):
-                self._arcade_cleared      = True
-                self._arcade_just_cleared = True
-                print(
-                    f"[BlankaEnv#{self.instance_id}] "
-                    f"🎮 *** ARCADE CLEARED *** step={self._ep_step}"
-                )
+        self._prev_in_combat = True
 
         # ── Terminación del episodio ──────────────────────────────────────────
         terminated = self._arcade_cleared
@@ -874,13 +883,13 @@ class BlankaEnv(gym.Env):
                 if (self._combat_p1_dmg == 0 or
                         self._prev_p1_hp > self._prev_p2_hp or
                         self._combat_p2_dmg >= 135):
-                    timeout_win              = True
-                    self._combat_won         = True
-                    self._combat_timeout_win = True
-                    print(f"[BlankaEnv#{self.instance_id}] Victoria por TIEMPO al cerrar")
+                    timeout_win               = True
+                    self._combat_won          = True
+                    self._combat_timeout_win  = True
+                    print(f"[BlankaEnv#{self.instance_id}] Victoria por TIEMPO al cerrar episodio")
             self._flush_combat_to_registry(timeout_win=timeout_win)
 
-            tag = "ARCADE CLEAR" if terminated else f"TRUNCATION step={self._ep_step}"
+            tag = "ARCADE CLEAR ✅" if terminated else f"TRUNCATION step={self._ep_step}"
             print(
                 f"[BlankaEnv#{self.instance_id}] {tag} "
                 f"| rivales={self._rivals_defeated} "
@@ -890,7 +899,11 @@ class BlankaEnv(gym.Env):
 
         won = self._won_round or self._combat_won
 
-        r = self._calc_reward(p1hp, p2hp, st, action)
+        # ── Calcular reward ───────────────────────────────────────────────────
+        # [FIX CRÍTICO]: _calc_reward recibe extra_bonus que incluye bonificaciones
+        # de ronda/match ya calculadas arriba. r ya tiene valor definido.
+        r = self._calc_reward(p1hp, p2hp, st, action, extra_bonus=extra_reward)
+
         self._prev_p1_hp  = p1hp
         self._prev_p2_hp  = p2hp
         self._last_action = action
@@ -898,13 +911,16 @@ class BlankaEnv(gym.Env):
         return self._get_obs(st), r, terminated, truncated, self._build_info(
             p1hp=p1hp, p2hp=p2hp, action=action,
             timeout_win=timeout_win,
-            p2_just_died=p2_just_died or almost_ko,
+            p2_just_died=(p2_just_died or almost_ko),
             won=won,
             round_won_this_step=round_won_this_step,
             match_won_this_step=match_won_this_step,
             in_combat=True,
             terminated=terminated,
             truncated=truncated,
+            match_p1_wins=lua_p1_wins,
+            match_p2_wins=lua_p2_wins,
+            match_over=lua_match_over,
         )
 
     def render(self): pass

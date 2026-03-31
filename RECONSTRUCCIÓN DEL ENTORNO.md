@@ -1,160 +1,198 @@
-# 🧠 ROADMAP — HACIA LA AUTONOMÍA TOTAL (29/03/2026)
+# 🧠 ROADMAP — HACIA LA AUTONOMÍA TOTAL (actualizado 30/03/2026)
 
 ## 🟢 FASE 1: LÓGICA DE COMBATE (100% COMPLETADA)
 * Ejecución de ataques especiales (Rolling, Electricidad) desde Python.
 * **Rolling Attack 100% funcional** (bola + avance real).
 * Control de tiempos de carga (68 frames back + release 1f + forward+Strong 4f).
-* Force charge + easy flag + force anim + force posición X + sprite list.
-* **Release de left reducido a milisegundo visible**.
-* Macro lista para acción 15 del nuevo entorno.
+* Macro lista para acciones 15/16/17 del entorno.
 
 **Archivos clave:**
 - `force_rolling_final.lua` (versión definitiva)
-- Macro integrada en el nuevo `blanka_env.py`
+- Macros integradas en `blanka_env.py`
 
 ---
 
 ## 🟢 FASE 2: EXTRACCIÓN DE DATOS (100% COMPLETADA — 27/03/2026)
 
-### Qué se consiguió:
-1. ✅ Sincronización de HP y SIDE.
-2. ✅ Detección de Posición y Lado.
-3. ✅ IDs de Personajes P1 y P2 — confirmados por ingeniería inversa de RAM.
-4. ✅ Detección de Modo (ARCADE vs VS) — confirmada por diff de bloques de memoria.
-5. ✅ Cronómetro — dirección `0xFF8ACE` encontrada pero **NO FIABLE** (siempre 0 en combate). Reemplazado por timer estimado de frames internos en el bridge.
-
-### Cómo se obtuvo la detección de modo:
-- **V30**: barrido 64 bytes (FF8000-FF803F) + bloque IA (FF8C40-6F). Descartada.
-- **V31**: barrido 4 bloques de 256 bytes. Identificado `FF87E0-FF87FF` como candidato.
-- **V32**: veredicto definitivo. Doble dump para evitar falso negativo del primer frame.
+1. ✅ HP y SIDE sincronizados.
+2. ✅ IDs de Personajes P1 y P2 — ingeniería inversa de RAM.
+3. ✅ Detección de Modo ARCADE vs VS — diff de bloques de memoria.
+4. ✅ Cronómetro — `0xFF8ACE` encontrada pero **NO FIABLE**. Sustituida por timer de frames internos.
 
 ---
 
-## 🟢 FASE 3.1: ESTADO DINÁMICO P2 (100% COMPLETADA — 28/03/2026)
+## 🟢 FASE 3.1: ESTADO DINÁMICO P2 (100% — 28/03/2026)
 
-### Qué se consiguió:
 1. ✅ **P2_X** (`0xFF927C-7D`, 16-bit big-endian) — Rango: 728–855.
-2. ✅ **P2_CROUCH_FLAG** (`0xFF86C4`) — valor canónico corregido a `0x03` (agachado).
+2. ✅ **P2_CROUCH_FLAG** (`0xFF86C4 = 0x03` agachado).
 3. ✅ **P2_STUN** (`0xFF865A`) y **P2_STUN_SPRITE** (`0xFF8951 = 0x24`).
-4. ✅ **P2_ANIM_FRAME** (`0xFF86C1`): `0x0C` = lanzamiento Sonic Boom (y FK — ver Fase 3.2).
+4. ✅ **P2_ANIM_FRAME** (`0xFF86C1`).
 5. ✅ **P2_Y_VEL** (`0xFF86FC-FD`): signed 16-bit; `abs > 256` = airborne.
 6. ✅ **PROJ_SLOT_FLAG** (`0xFF8E30 = 0xA4`) y **PROJ_IMPACT** (`0xFF8E00 = 0x98`).
-7. ✅ **autostart_v33.lua** — narración acciones P2 en tiempo real, supresión logs oki.
 
 ---
 
-## 🟢 FASE 3.2: FK Y SONIC BOOM — COMPLETADA (28/03/2026)
+## 🟢 FASE 3.2: FK Y SONIC BOOM (100% — 28/03/2026)
 
-### Flash Kick — Anatomía definitiva (mapeo_guile_v4.lua)
+### Flash Kick — Anatomía definitiva
 
-Duración arco real: **~150 frames**. FK abortado (solo startup): ~24 frames.
-
-| Fase | ANIM_FRAME | Y_VEL (signed) | Frame relativo |
-|------|-----------|----------------|----------------|
+| Fase | ANIM_FRAME | Y_VEL | Frame relativo |
+|------|-----------|-------|----------------|
 | Startup | `0x0C` | −288 | f+0 |
 | Ascenso | `0x02` | −2304 | f+26 |
 | Cima | `0x00` | −2304 | f+123 |
 | Descenso | `0x04` | +1760 | f+126 |
-| Landing/Recovery | `0x0C` | ~0 | f+150 |
+| Landing | `0x0C` | ~0 | f+150 |
 
-**⚠️ ANIM=0x0C es ambiguo:** aparece en Sonic Boom throw (tierra), FK startup (airborne, Y_VEL=−288) y FK landing (tierra). Desambiguar siempre con `abs(Y_VEL) > 256`.
+⚠️ `ANIM=0x0C` ambiguo: aparece en Boom throw, FK startup y FK landing. Desambiguar con `abs(Y_VEL) > 256`.
 
-**Ventana de Rolling Attack:** al detectar el flanco `airborne→tierra` (FK_RECOVERY).
+Ventana de Rolling Attack: flanco `airborne→tierra` (FK_RECOVERY). Obs[26] = `0 < fk_land_steps <= 20`.
 
-### Sonic Boom — PROJ_X: hipótesis descartada, workaround validado
+### Sonic Boom — PROJ_X descartada
 
-**Conclusión:** Los bloques `0xFF9300`, `0xFF9400`, `0xFF9500` permanecen a cero durante todo el vuelo del boom.
-
-**Workaround definitivo:**
-1. Detectar throw: `ANIM_FRAME == 0x0C` con `Y_VEL~0` (tierra)
-2. Estimar X: `P2_X - frames_desde_throw × 25 ud/frame`
-3. Impacto inminente: `PROJ_IMPACT == 0x98` (~0.5s pre-daño)
+`0xFF9300-0xFF9500` permanecen a cero durante el vuelo. Workaround:
+1. Detectar throw: `ANIM=0x0C` con `Y_VEL~0`.
+2. Estimar X: `P2_X − frames_desde_throw × 25 ud/frame`.
+3. Impacto inminente: `PROJ_IMPACT = 0x98`.
 
 ---
 
-## 🟢 FASE 3.3: BRIDGE Y ENTORNO PPO (100% COMPLETADA — 28/03/2026 sesión 3)
+## 🟢 FASE 3.3: BRIDGE Y ENTORNO PPO (100% — 28/03/2026 sesión 3)
 
-### Qué se consiguió:
-1. ✅ **`mame_bridge.py`** — bridge de archivos Python↔MAME con API limpia.
-2. ✅ **`env/blanka_env.py` v2.1** — claves de estado alineadas con lua_bridge v2.0.
-3. ✅ **`core/rival_registry.py`** — registro persistente de estadísticas por rival.
+1. ✅ **`mame_bridge.py`** — bridge de archivos Python↔MAME.
+2. ✅ **`env/blanka_env.py` v2.1** — primer entorno Gymnasium operativo.
+3. ✅ **`core/rival_registry.py`** — registro persistente de estadísticas.
 4. ✅ **`train_blanka_v1.py`** — entrenamiento PPO single-env visible.
 
 ---
 
-## 🟢 FASE 3.4: FIXES BRIDGE Y ENTORNO (100% COMPLETADA — 29/03/2026)
+## 🟢 FASE 3.4: FIXES BRIDGE Y ENTORNO (100% — 29/03/2026 al 30/03/2026)
 
-### autoplay_bridge.lua v1.13
-- Timer RAM `0xFF8ACE` confirmado como inútil (devuelve siempre 0).
-- Timer en `state.txt` = `ceil((MAX_COMBAT_FRAMES - diag_combat_frame) / 60)`, fiable.
-- `MAX_COMBAT_FRAMES = 6400` (99s × 60fps + 7% margen).
+### autoplay_bridge.lua → v2.3 (30/03/2026)
 
-### blanka_env.py v2.7
-- Recompensas Rolling elevadas para compensar crédito tardío de macro 69f:
-  - Rolling hit + distancia óptima: **+30** (antes +12)
-  - Rolling hit fuera de distancia: **+20** (antes +8)
-  - Rolling en ventana post-FK con hit: **+35** (antes +15)
-  - Rolling en ventana post-FK sin hit: **+8** (antes +4)
-  - Rolling sin hit: **-2** (penalización suave)
-- Bonus de carga acumulada: +0.05/step mientras se mantiene ← (total +3.4 en 68 steps).
+**v1.13:** Timer RAM `0xFF8ACE` = 0 confirmado. Timer estimado por frames internos (`MAX_COMBAT_FRAMES=6400`).
 
-### autoplay_bridge.lua v1.14
-- **FIX CRÍTICO:** `PRESS_CONTINUE` usaba `BTN_JAB` — SF2CE no acepta punches en esa pantalla. Cambiado a `"1 Player Start"` con 3 pulsos espaciados (f=20, f=60, f=100).
+**v1.14:** FIX CRÍTICO — `PRESS_CONTINUE` usaba JAB. SF2CE no acepta punches en esa pantalla. Cambiado a `"1 Player Start"` con 3 pulsos.
 
-### blanka_env.py v2.8
-- Flag `ROLLING_ONLY: bool = False` en línea ~45.
-- Cuando `True`, `step()` ignora la política del agente y fuerza acción 15.
-- El flip de dirección (LEFT↔RIGHT) funciona automáticamente en ambos lados.
-- Imprime stats de hit rate al final de cada episodio.
+**v1.15:** Estado `CHAR_SELECT_CONTINUE` entre PRESS_CONTINUE y WAIT_COMBAT. Bridge pulsa JAB ×2 para confirmar Blanka sin esperar timeout de ~9s.
 
-### autoplay_bridge.lua v1.15
-- **FIX:** Nuevo estado `CHAR_SELECT_CONTINUE` entre `PRESS_CONTINUE` y `WAITING_COMBAT`.
-- Tras el continue, SF2CE muestra char select con cursor ya en Blanka.
-- Sin input hace timeout (~9s) y elige personaje aleatoriamente.
-- El bridge pulsa JAB dos veces (f=20, f=60) para confirmar Blanka de inmediato.
-- Flujo: `PRESS_CONTINUE → CHAR_SELECT_CONTINUE → WAITING_COMBAT`
+**v2.3 (VERSIÓN ACTUAL):** FSM completamente rediseñada como event-driven pura.
+- Eliminado `CHAR_SELECT_CONTINUE` — sustituido por `is_continue=true` en `CHAR_NAVIGATE`.
+- `GAME_OVER` inserta coin + pulsa Start en bucle hasta detectar HP restaurados.
+- **FIX anti-bucle**: `wait_timeout_count` — si `WAIT_COMBAT` expira con `is_continue=true` más de `WAIT_TIMEOUT_MAX=3` veces consecutivas, fuerza reinicio completo desde `INSERT_COIN`. Resuelve el bug de vuelta a pantalla de título tras continues fallidos.
+- Reset de `wait_timeout_count` al entrar en `IN_COMBAT`.
+
+### blanka_env.py → v4.4 (VERSIÓN ACTUAL)
+
+**v2.7:** Recompensas Rolling elevadas. Bonus de carga acumulada +0.05/step.
+
+**v2.8:** Flag `ROLLING_ONLY: bool = False`. Modo depuración que fuerza acción 15 en cada step.
+
+**v3.x–v4.3:** (intermediate) Añadidas acciones 16–25. Tracking de bosses, bonus stages, arcade clear. Round tracking granular. Eliminado ROLLING_ONLY, introducido ROLLING_AND_ELECTRIC_ONLY. Episodio extendido a arcade completo.
+
+**v4.4 (ACTUAL):**
+- **[FIX CRÍTICO]** Eliminada truncación por `MENU_FRAMES_MAX`. Los frames fuera de combate son parte normal del flujo — no terminan el episodio.
+- **[FIX]** `ep_rounds_played` se inicializa a 1 en reset (primer combate). Se incrementa solo al detectar inicio real de ronda.
+- **[FIX]** `ep_matches_played` inicializado a 0 en reset; incrementa al detectar primer combate y en cada cambio de rival.
+- **[LIMPIEZA]** `_out_of_combat_frames` solo es métrica diagnóstica; no trunca.
+
+### mame_bridge.py → v1.3 (VERSIÓN ACTUAL)
+- Paths movidos a `BASE_DIR\dinamicos\`. Siempre con sufijo `_N`.
+- Directorio `dinamicos\` creado automáticamente.
+- Consistente con Lua v2.3.
+
+### train_blanka_v1.py → v2.1 (VERSIÓN ACTUAL)
+- Episodio NO termina por Game Over.
+- `reset()` no llama a `soft_reset`/`restart_game` — el Lua gestiona todo.
+- Rewards en frames fuera de combate = 0.
+- Tracking: `arcade_clears`, `boss_X_eps` en TensorBoard.
+
+### train_FASE1.py → v2.1 (NUEVA)
+- 6 instancias MAME headless con claim protocol.
+- `SubprocVecEnv`, `N_STEPS=1365` (×6 = 8190 por rollout), `ent_coef=0.10`.
+- Tracking granular: `cl1/boss_*_eps`, `cl1/arcade_clears`, `cl1/bonus_stage_eps`.
+- Print inmediato al alcanzar cada boss y al completar el arcade.
 
 ---
 
 ## 🔴 FASE 4: INTELIGENCIA ARTIFICIAL — PPO (EN CURSO)
 
-**Vector de estado completo (30 dimensiones):**
+### Semántica del episodio (CLAVE)
 ```
-[HP_P1, P1_X, P1_AIRBORNE, P1_DIR, P1_STUN,
- HP_P2, P2_X, P2_CROUCH, P2_AIRBORNE, P2_STUN,
- DISTANCIA, DISTANCIA_SIGNED, TIMER,
- P1_EN_ESQUINA, P2_EN_ESQUINA, DIFF_VIDA,
- DAÑO_RECIBIDO_RECIENTE, DAÑO_INFLIGIDO_RECIENTE,
- FK_PHASE, BOOM_ACTIVO, BOOM_X_EST, PROJ_SLOT, BOOM_TIMER,
- CARGA_ACUMULADA, RIVAL_TIERRA_MUCHO, RIVAL_HITSTOP,
- VENTANA_POST_FK, ULTIMA_ACCION, BLANKA_ATERRIZANDO, ROLLING_JUMP_RDY]
+reset() → espera in_combat=True, ambos HP >= 100 (hasta 60s)
+step() × N:
+  · frames fuera de combate: reward=0, sin truncación
+  · Game Over: el Lua pulsa Continue → MISMO episodio continúa
+  · Arcade Clear (Bison KO): terminated=True ← FIN
+  · ep_step >= 30000: truncated=True ← FIN
 ```
 
-**Acciones (24):** 0-14 single frame | 15 Rolling | 16 Electricidad | 17-22 Saltos con ataque | 23 Rolling-Jump
+### Vector de estado (30 dims)
+```
+[0-4]   HP, X, airborne, dir, stun de P1
+[5-9]   HP, X, crouch, airborne, stun de P2
+[10-17] distancias, timer, esquinas, diff_hp, daños recientes
+[18-22] fk_phase, boom_activo, boom_x_est, proj_slot, boom_timer
+[23-29] charge, rival_tierra_mucho, rival_hitstop, ventana_post_fk,
+        ultima_accion, blanka_aterrizando, rolling_jump_rdy
+```
 
-**Recompensas clave:**
-- +100 por ganar ronda
-- +35 rolling con hit en ventana FK
-- +30 rolling con hit a distancia óptima
-- +10 por quitar vida a P2
-- -50 por perder ronda
-- -15 por recibir daño
+### Acciones (26)
+```
+0-14   Single frame (NOOP, direcciones, botones, combinaciones down+botón)
+15-17  Rolling Fierce / Strong / Jab (macros 73f)
+18     Electricidad (macro 7f)
+19-24  Saltos con ataque (macros 25f)
+25     Rolling Jump (macro 1f, solo en landing window)
+```
+
+### Hiperparámetros
+
+| Parámetro | CL-1 (train_FASE1.py) | Fase 2 (train_blanka_v1.py) |
+|-----------|----------------------|------------------------------|
+| n_envs | 6 | 1 |
+| n_steps | 1365 | 4096 |
+| batch_size | 128 | 128 |
+| n_epochs | 4 | 4 |
+| lr | 3e-4 | 1e-4 |
+| ent_coef | 0.10 | 0.03 |
+| gamma | 0.99 | 0.99 |
+| total_steps | 1M | 5M |
+| red arch | [256, 256] | [256, 256] |
 
 ---
 
-## 🧹 LIMPIEZA DEL REPOSITORIO (HECHA)
-* Archivos legacy movidos a `/legacy/`:
-  - `sf2_env_blanka.py` (v3.4), todos los `test_*` antiguos
-  - `autonomy.py`, `ram_reader.py` (parcial)
-  - `autostart_v30.lua` .. `autostart_v32.lua`
-* Archivos activos:
-  - `force_rolling_final.lua`
-  - `lua/autoplay_bridge.lua` ← v1.15 activo
-  - `lua/lua_bridge.lua`
-  - `lua/autostart_v33.lua`
-  - `mame_controller.py`
-  - `env/blanka_env.py` ← v2.8
-  - `config/constants.py` ← fuente de verdad de todas las direcciones RAM
+## 🟡 PROBLEMAS CONOCIDOS Y LIMITACIONES
+
+### Problema 1 — Flag global `ROLLING_AND_ELECTRIC_ONLY`
+Es una constante a nivel de módulo. Si se olvida cambiar antes de lanzar `train_FASE1.py`, CL-1 corre en modo PPO completo sin aviso de error.
+**Workaround temporal:** el script imprime un aviso. **Solución definitiva:** convertirlo en parámetro de `BlankaEnv.__init__`.
+
+### Problema 2 — `ep_rounds_played` con continues
+Cada continue que devuelve al combate incrementa el contador. El número refleja "intentos totales", no "rondas reales del arcade". Tenerlo en cuenta al interpretar `ep_round_win_rate` en TensorBoard.
+
+### Problema 3 — `almost_ko` marca victoria prematura
+El bloque `almost_ko = (combat_p2_dmg >= 130 and p2hp <= 30 and dp2 > 0)` marca `combat_won=True` antes del KO real. La guarda `if not self._combat_won` previene doble registro. El print de `¡KO!` puede aparecer con `p2hp=30` en lugar de 0. Cosmético, no funcional.
+
+---
+
+## 🔜 PRÓXIMOS PASOS INMEDIATOS
+
+1. **Antes de lanzar CL-1**: poner `ROLLING_AND_ELECTRIC_ONLY = True` en `blanka_env.py`.
+2. Ejecutar `python reset_training.py` para limpiar estado previo.
+3. Lanzar `python train_FASE1.py --steps 1000000 --envs 6`.
+4. Monitorizar `cl1/avg_p2_damage` y `cl1/win_rate` en TensorBoard.
+5. Al superar `avg_p2_damage > 40`, guardar modelo CL-1 y decidir:
+   - Pasar directamente a Fase 2 (train_blanka_v1.py con --resume).
+   - Implementar CL-2 (defensa) si el agente sigue recibiendo mucho daño.
+
+## 🔜 PRÓXIMOS PASOS MEDIOS
+
+6. Implementar `CurriculumScheduler` que lea `RivalRegistry` y cambie flags automáticamente.
+7. Convertir `ROLLING_AND_ELECTRIC_ONLY` en parámetro de `BlankaEnv.__init__`.
+8. Considerar reducir `MAX_STEPS` en CL-1 (10000 en lugar de 30000) para episodios más cortos y updates más frecuentes.
+9. CL-2: flag `DEFENSE_ONLY` — fuerza acciones 1 (UP), 3/4 (mover), 25 (rolling-jump).
+10. CL-3: ofensiva combinada — acciones 15-25 activas, 0-14 solo NOOP y direcciones.
 
 ---
 
@@ -180,16 +218,13 @@ MODO ARCADE vs VS
   Caveat          = leer a partir del 2º dump (~3s de combate)
 
 CRONOMETRO
-  TIMER_ADDR      = 0xFF8ACE  ⚠️ NO FIABLE — siempre devuelve 0 en combate.
-                               Usar timer estimado: ceil((6400 - combat_frame) / 60)
+  TIMER_ADDR      = 0xFF8ACE  ⚠️ NO FIABLE — siempre 0 en combate.
+  Timer fiable    = ceil((6400 - diag_combat_frame) / 60)
 
 POSICION X
-  P1_X_H_ADDR     = 0xFF917C  (byte alto, 16-bit big-endian)
-  P1_X_L_ADDR     = 0xFF917D  (byte bajo)
-  P2_X_H_ADDR     = 0xFF927C  (byte alto, 16-bit big-endian)
-  P2_X_L_ADDR     = 0xFF927D  (byte bajo)
+  P1_X_H_ADDR     = 0xFF917C  P1_X_L_ADDR = 0xFF917D  (big-endian)
+  P2_X_H_ADDR     = 0xFF927C  P2_X_L_ADDR = 0xFF927D  (big-endian)
   Rango P2        = 0x02D8 (728) .. 0x0357 (855)
-  Coordenadas     = valores MAYORES = mas a la DERECHA
 
 STUN
   P2_STUN_ADDR        = 0xFF865A  (+5/hit)
@@ -198,63 +233,28 @@ STUN
 
 POSE / ANIMACION
   P2_CROUCH_FLAG_ADDR = 0xFF86C4  (0x03=agachado | 0x02=de pie)
-  P2_ANIM_FRAME_ADDR  = 0xFF86C1  (ver tabla FK)
+  P2_ANIM_FRAME_ADDR  = 0xFF86C1
 
-FLASH KICK — ANATOMIA DEFINITIVA (mapeo_guile_v4 — 28/03/2026)
-  Fase          ANIM   Y_VEL     Frame
-  Startup       0x0C   -288      f+0
-  Ascenso       0x02   -2304     f+26
-  Cima          0x00   -2304     f+123
-  Descenso      0x04   +1760     f+126
-  Landing       0x0C   ~0        f+150
-  Duracion real ~150f | Abortado ~24f
-  ⚠️ 0x0C ambiguo: abs(Y_VEL)>256 -> FK | Y_VEL~0 -> Boom throw o Landing
+FLASH KICK — ANATOMIA DEFINITIVA
+  Startup  0x0C  -288   f+0
+  Ascenso  0x02  -2304  f+26
+  Cima     0x00  -2304  f+123
+  Descenso 0x04  +1760  f+126
+  Landing  0x0C  ~0     f+150
+  ⚠️ 0x0C ambiguo: abs(Y_VEL)>256 -> FK | ~0 -> Boom throw o Landing
 
-AIRBORNE
-  P2_Y_VEL_H_ADDR = 0xFF86FC
-  P2_Y_VEL_L_ADDR = 0xFF86FD  (signed 16-bit; abs>256 = en el aire)
+VELOCIDAD VERTICAL (signed 16-bit; abs>256 = aire)
+  P2: 0xFF86FC (H) / 0xFF86FD (L)
+  P1: 0xFF83FC (H) / 0xFF83FD (L)
 
 PROYECTIL SONIC BOOM
-  PROJ_SLOT_FLAG_ADDR = 0xFF8E30  (0xA4 = slot activo)
-  PROJ_IMPACT_ADDR    = 0xFF8E00  (0x98 = impacto ~0.5s antes del daño)
-  PROJ_X_ADDR         = ❌ NO EXISTE (ENT_PROJ_A/B/C permanecen a cero)
-  Workaround          = P2_X - frames_desde_throw × 25 ud/frame
-  BOOM_VEL_APPROX     = 25 ud/frame
+  PROJ_SLOT_FLAG  = 0xFF8E30  (0xA4 = slot activo)
+  PROJ_IMPACT     = 0xFF8E00  (0x98 = impacto ~0.5s antes del daño)
+  PROJ_X          = ❌ NO EXISTE (ENT_PROJ_A/B/C permanecen a cero)
+  Workaround      = P2_X - frames_desde_throw × 25 ud/frame
+  BOOM_VEL_APPROX = 25 ud/frame
 ```
 
 ---
-## 🔜 PRÓXIMO PASO
-  ENTRENAMIENTO PPO
-  4. Curriculum learning — Planning completo
-Fase CL-1: ROLLING_ONLY Y ROLLING puro (ya tienes el flag)
 
-ROLLING_AND_ELECTRIC_ONLY = True, 200-500 episodios
-Objetivo: que el modelo entienda la geometría del rolling y del electric (distancia, dirección, timing post-FK)
-Métrica de salida: hit rate > 40%
-
-Fase CL-2: Defensa ante Boom y FK
-
-Nueva flag DEFENSE_ONLY = True — fuerza acciones 1 (UP para saltar Boom), 3/4 (moverse), 23 (rolling-jump)
-Se desactivan acciones de ataque por completo en esta fase
-Objetivo: que el agente nunca reciba daño de Boom ni FK
-Métrica de salida: daño recibido promedio < 20 HP por episodio
-
-Fase CL-3: Ofensiva combinada (saltos + rolling)
-
-Activar acciones 15-23, desactivar 0-14 excepto NOOP y direcciones
-Sin macros de un solo frame al principio — forzar exploración de macros con action_mask
-Objetivo: que el agente conecte al menos 1 rolling + 1 salto por episodio
-Métrica: ep_p2_dmg > 30 en promedio
-
-Fase CL-4: PPO completo sin restricciones
-
-Cargar el modelo entrenado en Fase CL-3 como punto de partida
-Las 24 acciones disponibles, recompensas normales
-Objetivo final: winrate > 70%, después escalar a 100% + perfects
-
-Implementación técnica: Una clase CurriculumScheduler que inspecciona métricas del RivalRegistry y cambia flags entre fases. Se puede integrar en train_blanka_v1.py con un callback de SB3.
-
-
-
-
-**Meta final:** 100% winrate + perfects en todos los combates vs ia determinista.
+**Meta final:** 100% winrate + perfects en todos los combates vs IA determinista.

@@ -1,14 +1,5 @@
 -- =============================================================================
--- autoplay_bridge.lua  |  v2.3  |  SF2CE / MAME 0.286
--- =============================================================================
--- CAMBIOS v2.3 respecto a v2.2:
---   · FIX CRÍTICO: contador `wait_timeout_count` en WAIT_COMBAT.
---     Si WAIT_COMBAT expira con is_continue=true más de WAIT_TIMEOUT_MAX veces
---     consecutivas, se fuerza reinicio completo (INSERT_COIN) en lugar de
---     quedarse en el bucle infinito WAIT_COMBAT ↔ CHAR_CONFIRM.
---     Causa del bug: tras varios combates, el juego volvía a la pantalla de
---     título; el bridge seguía mandando JAB en char select inexistente.
---   · Reset de wait_timeout_count al entrar en IN_COMBAT.
+-- autoplay_bridge.lua  |  v2.0  |  SF2CE / MAME 0.286
 -- =============================================================================
 -- DISEÑO: FSM event-driven basada en RAM. SIN frame-counts como lógica
 -- principal. Los timeouts solo actúan como safety-net ante cuelgues.
@@ -30,9 +21,16 @@
 --         Insertar coin (event-driven: solo 1 coin)
 --         JAB para confirmar Blanka (preseleccionado por SF2CE)
 --         -> IN_COMBAT
+--
+-- DETECCIÓN DE "FIN DE ENFRENTAMIENTO":
+--   SF2CE arcade: enfrentamiento = mejor de 3 rondas (gana quien hace 2).
+--   Señal de game over = HP=0 de P1 Y después de ~60 frames HP sigue a 0
+--   Y NO sube (no hay reset de ronda). En ese punto estamos en countdown.
+--
+-- VELOCIDAD: funciona a cualquier velocidad (MAME throttle off).
 -- =============================================================================
 
-local BRIDGE_VERSION = "autoplay_bridge_v2.3"
+local BRIDGE_VERSION = "autoplay_bridge_v2.2"
 local BASE_DIR = "C:\\proyectos\\MAME\\"
 local DYN_DIR  = BASE_DIR .. "dinamicos\\"
 
@@ -85,6 +83,7 @@ end
 
 -- ─── DIRECCIONES RAM ─────────────────────────────────────────────────────────
 local ADDR = {
+    GAME_STATE   = 0xFF8005,
     P1_HP        = 0xFF83E9,
     P2_HP        = 0xFF86E9,
     P1_SIDE      = 0xFF83D0,
@@ -105,7 +104,13 @@ local ADDR = {
 
 local MAX_COMBAT_FRAMES = 6400  -- 99s × 60fps + margen
 local MIN_HP            = 100   -- HP mínimo para considerar combate activo
-local HP_ALIVE          = 10    -- HP > este valor = jugador vivo (no KO)
+local HP_ALIVE          = 0    -- HP > este valor = jugador vivo (no KO)
+
+-- Estado del enfrentamiento (Mejor de 3)
+local match_p1_wins = 0
+local match_p2_wins = 0
+local match_over = false
+local round_result = "none"
 
 -- ─── HARDWARE INIT ───────────────────────────────────────────────────────────
 local _mem       = nil
@@ -167,6 +172,12 @@ local function flush_inputs()
     end
 end
 
+-- Pulse helper: presionar un botón exactamente 1 vez por N frames (non-blocking)
+-- Uso: call every frame, returns true while button should be held
+local function pulse_once(held_flag_ref, btn, hold_frames, release_frames)
+    -- Se gestiona externamente con contadores de estado
+end
+
 -- ─── RAM HELPERS ─────────────────────────────────────────────────────────────
 local function ru8(a)
     if not _mem then return 0 end
@@ -213,7 +224,7 @@ local last_input = {0,0,0,0,0,0,0,0,0,0,0,0}
 
 -- ─── TRANSICIÓN FSM ──────────────────────────────────────────────────────────
 local function transition(new_state)
-    print(string.format("[AB v2.3 ID%d F%d] %s -> %s",
+    print(string.format("[AB v2.2 ID%d F%d] %s -> %s",
         INSTANCE_ID or 0, frame_count, sm_state, new_state))
     sm_state  = new_state
     sm_frame  = 0
@@ -326,6 +337,7 @@ local function to_json(s)
         '"boom_active":%s,"boom_x_est":%s,"boom_incoming":%s,'..
         '"boom_slot_active":%s,"boom_throw_this_frame":%s,'..
         '"fk_landing_this_frame":%s,"p2_hitstop":0,'..
+        '"match_p1_wins":%d,"match_p2_wins":%d,"match_over":%s,"round_result":"%s",'..
         '"in_combat":%s,"frame":%d}',
         s.p1_hp,s.p2_hp,s.p1_x,s.p2_x,s.p1_dir,
         s.p1_char,s.p2_char,s.timer,
@@ -335,6 +347,7 @@ local function to_json(s)
         bts(s.boom_active),fmtf(s.boom_x_est),bts(s.boom_incoming),
         bts(s.boom_slot_active),bts(s.boom_throw_this_frame),
         bts(s.fk_landing_this_frame),
+        match_p1_wins, match_p2_wins, bts(match_over), round_result,
         bts(sm_state=="IN_COMBAT"),
         s.frame)
 end
@@ -369,38 +382,51 @@ end
 -- =============================================================================
 -- FSM — MÁQUINA DE ESTADOS
 -- =============================================================================
+-- La FSM se basa en detectar eventos RAM, no en contar frames.
+-- sm_frame solo se usa para safety timeouts (muy holgados).
+--
+-- SEÑALES RAM USADAS:
+--   p1_hp, p2_hp: presencia en combate y estado de vida
+--   p1_char, p2_char: no se usan para navegar (no cambian en char select)
+--
+-- DETECCIÓN DE PANTALLAS:
+--   · "En combate"  = p1_hp >= MIN_HP Y p2_hp >= MIN_HP (sostenido N frames)
+--   · "KO"          = p1_hp <= HP_ALIVE O p2_hp <= HP_ALIVE
+--   · "Nueva ronda" = tras KO, ambos HP suben a >= MIN_HP de nuevo
+--   · "Game over"   = tras KO de P1, HP de P1 no sube en ~360 frames
+--
+-- ESTRUCTURA CHAR SELECT:
+--   SF2CE layout fila superior: Ryu(0) Honda(1) Blanka(2) Guile(3) Ken(4) Chun(5)
+--   Cursor arranca en Ryu tras 1P Start. 2x RIGHT = Blanka.
+--   Tras continue: cursor ya en Blanka, solo JAB.
+-- =============================================================================
 
--- Contadores de estabilidad
+-- Contadores de estabilidad (para señales con ruido)
 local hp_stable_count = 0
-local HP_STABLE_NEED  = 8
+local HP_STABLE_NEED  = 8   -- frames consecutivos con HP estable para confiar
 
--- Navegación char select
-local char_nav_step   = 0
-local char_nav_frame  = 0
-local is_continue     = false
+-- Estado de navegación char select
+local char_nav_step   = 0   -- 0=esperando, 1=primer RIGHT, 2=segundo RIGHT, 3=done
+local char_nav_frame  = 0   -- frame dentro del paso actual
+local is_continue     = false  -- true si venimos de un continue (Blanka presel.)
 
--- Coin/start
+-- Estado coin/start (para no spam)
 local coin_inserted   = false
 local start_pressed   = false
 
--- ROUND_OVER: distinguir nueva ronda vs game over
+-- Estado ROUND_OVER: para distinguir nueva ronda vs game over
+-- Contamos cuántos frames consecutivos P1 sigue con HP <= HP_ALIVE tras KO
 local ko_frames       = 0
-local KO_GAME_OVER_N  = 360
+local KO_GAME_OVER_N  = 360  -- si P1 no recupera HP en 360 frames → game over
 
+-- Para detectar si Blanka murió (no el rival)
 local blanka_ko       = false
-
--- ─── FIX v2.3: contador de timeouts consecutivos en WAIT_COMBAT ───────────────
--- Si el juego vuelve a la pantalla de título tras un continue fallido,
--- el bridge se quedaba en el bucle WAIT_COMBAT ↔ CHAR_CONFIRM indefinidamente.
--- Con este contador, tras WAIT_TIMEOUT_MAX timeouts seguidos forzamos
--- un reinicio completo (INSERT_COIN), que recupera cualquier situación.
-local wait_timeout_count = 0
-local WAIT_TIMEOUT_MAX   = 3   -- número de timeouts antes de reinicio completo
 
 -- ─── TICK FSM ────────────────────────────────────────────────────────────────
 local function tick_fsm(st)
     sm_frame = sm_frame + 1
 
+    -- Determinar si estamos "en combate activo" por HP
     local p1_alive   = st.p1_hp > HP_ALIVE
     local p2_alive   = st.p2_hp > HP_ALIVE
     local both_alive = p1_alive and p2_alive
@@ -408,15 +434,25 @@ local function tick_fsm(st)
     -- =========================================================================
     if sm_state == "BOOTING" then
     -- =========================================================================
+    -- Esperar a que la ROM arranque y la memoria sea válida.
+    -- Señal de salida: hardware inicializado (_mem_ok y _fields_ok).
+    -- Safety timeout: 600 frames (~10s a velocidad normal).
+
         if _mem_ok and _fields_ok then
             transition("INSERT_COIN")
         elseif sm_frame >= 600 then
+            -- Hardware no listo, reintentar init
             sm_frame = 0
         end
 
     -- =========================================================================
     elseif sm_state == "INSERT_COIN" then
     -- =========================================================================
+    -- Insertar exactamente 1 moneda.
+    -- Pulsamos Coin 1 una sola vez al entrar (sm_frame==1), luego esperamos.
+    -- Señal de salida: sm_frame >= 30 (tiempo mínimo para que el juego registre).
+    -- Después vamos a PRESS_START para buscar la pantalla "Press Start".
+
         if sm_frame == 1 then
             hold(BTN_COIN)
             coin_inserted = true
@@ -424,6 +460,9 @@ local function tick_fsm(st)
             release(BTN_COIN)
         end
 
+        -- Tras 60 frames (1s a 60fps, mucho menos a alta velocidad, pero ok
+        -- porque la señal real es sm_frame no el tiempo) ir a PRESS_START.
+        -- A alta velocidad estos 60 frames son muy rápidos (milisegundos).
         if sm_frame >= 60 then
             transition("PRESS_START")
         end
@@ -431,14 +470,23 @@ local function tick_fsm(st)
     -- =========================================================================
     elseif sm_state == "PRESS_START" then
     -- =========================================================================
+    -- Pulsar 1P Start para ir al char select desde el title/attract screen.
+    -- El juego debe tener al menos 1 crédito (ya insertado).
+    -- Pulsamos Start repetidamente hasta detectar cambio de pantalla.
+    -- "Cambio de pantalla" = no podemos detectarlo por RAM directamente,
+    -- así que pulsamos Start cada 20 frames y esperamos 120 frames máximo.
+
+        -- Pulsar Start cada 20 frames
         if sm_frame % 20 == 1 then
             hold(BTN_START)
         elseif sm_frame % 20 == 6 then
             release(BTN_START)
         end
 
+        -- Después de 120 frames, asumimos que el char select está visible.
+        -- (A alta velocidad = muy rápido, pero suficiente para que el juego reaccione.)
         if sm_frame >= 120 then
-            is_continue   = false
+            is_continue   = false  -- primera vez, cursor en Ryu
             char_nav_step = 0
             char_nav_frame = 0
             transition("CHAR_NAVIGATE")
@@ -447,7 +495,17 @@ local function tick_fsm(st)
     -- =========================================================================
     elseif sm_state == "CHAR_NAVIGATE" then
     -- =========================================================================
+    -- Navegar cursor hasta Blanka: 2 pulsaciones RIGHT desde Ryu.
+    -- Se usa SOLO en la primera selección (is_continue=false).
+    -- Protocolo de cada pulse: hold 8f, release 12f → total 20f por pulse.
+    --
+    -- Paso 0 (char_nav_step=0): esperar 20f para que char select sea interactivo
+    -- Paso 1 (char_nav_step=1): primer RIGHT (Ryu → Honda)
+    -- Paso 2 (char_nav_step=2): segundo RIGHT (Honda → Blanka)
+    -- Paso 3 (char_nav_step=3): navegar completado → CHAR_CONFIRM
+
         if is_continue then
+            -- Venimos de continue: Blanka ya preseleccionado, no navegar
             transition("CHAR_CONFIRM")
             return
         end
@@ -455,12 +513,14 @@ local function tick_fsm(st)
         char_nav_frame = char_nav_frame + 1
 
         if char_nav_step == 0 then
+            -- Esperar que el char select sea interactivo (20f)
             if char_nav_frame >= 20 then
                 char_nav_step  = 1
                 char_nav_frame = 0
             end
 
         elseif char_nav_step == 1 then
+            -- Primer RIGHT
             if char_nav_frame <= 8 then
                 hold("P1 Right")
             else
@@ -472,6 +532,7 @@ local function tick_fsm(st)
             end
 
         elseif char_nav_step == 2 then
+            -- Segundo RIGHT
             if char_nav_frame <= 8 then
                 hold("P1 Right")
             else
@@ -486,15 +547,20 @@ local function tick_fsm(st)
             transition("CHAR_CONFIRM")
         end
 
+        -- Safety timeout (solo si algo falla)
         if sm_frame >= 500 then
-            print("[AB v2.3] TIMEOUT CHAR_NAVIGATE -> reintento INSERT_COIN")
+            print("[AB v2.1] TIMEOUT CHAR_NAVIGATE -> reintento INSERT_COIN")
             char_nav_step = 0; char_nav_frame = 0
+            -- is_continue se preserva: si era continue, seguirá siendo continue
             transition("INSERT_COIN")
         end
 
     -- =========================================================================
     elseif sm_state == "CHAR_CONFIRM" then
     -- =========================================================================
+    -- Solo dar el JAB de confirmación. La espera de HP la hace WAIT_COMBAT.
+    -- Sin timeout destructivo aquí.
+
         if sm_frame == 10 then
             hold(BTN_JAB)
         elseif sm_frame == 20 then
@@ -509,47 +575,40 @@ local function tick_fsm(st)
     -- =========================================================================
     elseif sm_state == "WAIT_COMBAT" then
     -- =========================================================================
+    -- Esperar a que el combate arranque (ambos HP >= MIN_HP estables).
+    -- Safety timeout: reintentar preservando is_continue para no navegar
+    -- con 2xRIGHT cuando venimos de un continue.
+
         if both_alive then
             hp_stable_count = hp_stable_count + 1
             if hp_stable_count >= HP_STABLE_NEED then
-                hp_stable_count  = 0
-                wait_timeout_count = 0   -- reset: combate arrancó OK
+                hp_stable_count = 0
                 transition("IN_COMBAT")
             end
         else
             hp_stable_count = 0
         end
 
-        -- Safety timeout con lógica anti-bucle (FIX v2.3)
         if sm_frame >= 1200 then
-            wait_timeout_count = wait_timeout_count + 1
-            print(string.format("[AB v2.3] TIMEOUT WAIT_COMBAT #%d/%d (is_continue=%s)",
-                wait_timeout_count, WAIT_TIMEOUT_MAX, bts(is_continue)))
+            print(string.format("[AB v2.1] TIMEOUT WAIT_COMBAT (is_continue=%s)",
+                bts(is_continue)))
             hp_stable_count = 0
-
-            if is_continue and wait_timeout_count < WAIT_TIMEOUT_MAX then
-                -- Todavía hay margen: reintentar solo el JAB de confirmación
-                transition("CHAR_CONFIRM")
+            if is_continue then
+                transition("CHAR_CONFIRM")   -- solo repetir JAB
             else
-                -- Demasiados timeouts consecutivos O no es continue:
-                -- el juego probablemente volvió a la pantalla de título.
-                -- Forzar reinicio completo desde INSERT_COIN.
-                print(string.format(
-                    "[AB v2.3] REINICIO COMPLETO (timeouts=%d, is_continue=%s) -> INSERT_COIN",
-                    wait_timeout_count, bts(is_continue)))
-                wait_timeout_count = 0
-                is_continue        = false
-                char_nav_step      = 0
-                char_nav_frame     = 0
-                transition("INSERT_COIN")
+                transition("INSERT_COIN")    -- reinicio completo
             end
         end
 
     -- =========================================================================
     elseif sm_state == "IN_COMBAT" then
     -- =========================================================================
+    -- Combate activo. Leer input Python y ejecutarlo.
+    -- Señal de salida: HP de algún jugador cae a <= HP_ALIVE.
+
         diag_combat_frame = diag_combat_frame + 1
 
+        -- Leer input de Python
         local buttons = read_python_input()
         if buttons then
             last_input = buttons
@@ -572,45 +631,115 @@ local function tick_fsm(st)
         if (b[9]  or 0)~=0 then hold(BTN_FORWARD)    end
         if (b[10] or 0)~=0 then hold(BTN_ROUNDHOUSE) end
 
+        -- Detectar fin de combate usando HP estricto (0) y validación de estado
         local p1_dead = (st.p1_hp <= HP_ALIVE)
         local p2_dead = (st.p2_hp <= HP_ALIVE)
         local timeout = (diag_combat_frame >= MAX_COMBAT_FRAMES)
+        local game_state = ru8(ADDR.GAME_STATE)
 
+        -- Si alguien muere, hay timeout, o el GAME_STATE transiciona a KO (>=0x0A suele marcar secuencias de fin)
         if p1_dead or p2_dead or timeout then
             clear_all()
-            blanka_ko = p1_dead
             ko_frames = 0
+            
+            -- Lógica estricta de victorias y Double KO
             if timeout then
-                print(string.format("[AB v2.3] TIMEOUT COMBATE | P1=%d P2=%d",
-                    st.p1_hp, st.p2_hp))
-                blanka_ko = (st.p1_hp <= st.p2_hp)
+                if st.p1_hp > st.p2_hp then
+                    round_result = "win"
+                    match_p1_wins = match_p1_wins + 1
+                    blanka_ko = false
+                elseif st.p2_hp > st.p1_hp then
+                    round_result = "loss"
+                    match_p2_wins = match_p2_wins + 1
+                    blanka_ko = true
+                else
+                    -- Empate por vida exacta en timeout = Double KO
+                    round_result = "draw"
+                    match_p1_wins = match_p1_wins + 1
+                    match_p2_wins = match_p2_wins + 1
+                    blanka_ko = false
+                end
             else
-                print(string.format("[AB v2.3] KO DETECTADO | P1=%d P2=%d blanka_ko=%s",
-                    st.p1_hp, st.p2_hp, bts(p1_dead)))
+                if p1_dead and p2_dead then
+                    -- DOUBLE KO REAL
+                    round_result = "draw"
+                    match_p1_wins = match_p1_wins + 1
+                    match_p2_wins = match_p2_wins + 1
+                    blanka_ko = true
+                elseif p2_dead then
+                    round_result = "win"
+                    match_p1_wins = match_p1_wins + 1
+                    blanka_ko = false
+                elseif p1_dead then
+                    round_result = "loss"
+                    match_p2_wins = match_p2_wins + 1
+                    blanka_ko = true
+                end
             end
+
+            if match_p1_wins >= 2 or match_p2_wins >= 2 then
+                match_over = true
+            end
+
+            print(string.format("[AB v2.3] FIN DE RONDA | P1=%d P2=%d | Marcador: %d-%d | DoubleKO: %s", 
+                st.p1_hp, st.p2_hp, match_p1_wins, match_p2_wins, bts(p1_dead and p2_dead)))
+            
             transition("ROUND_OVER")
         end
 
     -- =========================================================================
-    elseif sm_state == "ROUND_OVER" then
+elseif sm_state == "ROUND_OVER" then
     -- =========================================================================
+    -- Fin de ronda o enfrentamiento. DOS salidas posibles:
+    --
+    -- A) HP RESET (nueva ronda o nuevo rival):
+    --   SF2CE resetea ambos HP. Los HP pasan por 0 un frame antes de subir,
+    --   así que NO basta mirar "ambos > MIN_HP" — hay que detectar el FLANCO
+    --   de subida: prev_hp era bajo y ahora sube a >= MIN_HP.
+    --   También aceptamos "ambos estables > MIN_HP" por si el flanco se pierde.
+    --
+    -- B) GAME OVER (countdown):
+    --   Los HP NO suben. Aplica tanto si perdió Blanka (blanka_ko=true) como
+    --   si ganó Blanka pero el juego se quedó colgado (blanka_ko=false).
+    --   Señal: cualquiera de los dos HP lleva KO_GAME_OVER_N frames sin subir.
+
         local p1_rising = (prev_p1_hp <= HP_ALIVE and st.p1_hp >= MIN_HP)
         local p2_rising = (prev_p2_hp <= HP_ALIVE and st.p2_hp >= MIN_HP)
         local hp_flank  = p1_rising and p2_rising
 
+        -- Detección por flanco (más fiable que esperar estado estable)
         if hp_flank then
             hp_stable_count = hp_stable_count + 1
-            if hp_stable_count >= 3 then
+            if hp_stable_count >= 3 then   -- solo 3 frames para confirmar el flanco
                 hp_stable_count = 0
                 ko_frames = 0
+                
+                -- SI EL MATCH HABÍA TERMINADO, ESTE ES UNO NUEVO
+                if match_over then
+                    match_p1_wins = 0
+                    match_p2_wins = 0
+                    match_over = false
+                end
+                round_result = "none" -- Reiniciamos señal de ronda
+
                 print("[AB v2.3] HP RESET (flanco) -> nueva ronda / nuevo rival")
                 transition("IN_COMBAT")
             end
+        -- Detección por estado estable (fallback si se pierde el flanco)
         elseif both_alive then
             hp_stable_count = hp_stable_count + 1
             if hp_stable_count >= HP_STABLE_NEED then
                 hp_stable_count = 0
                 ko_frames = 0
+                
+                -- SI EL MATCH HABÍA TERMINADO, ESTE ES UNO NUEVO
+                if match_over then
+                    match_p1_wins = 0
+                    match_p2_wins = 0
+                    match_over = false
+                end
+                round_result = "none" -- Reiniciamos señal de ronda
+
                 print("[AB v2.3] HP RESET (estable) -> nueva ronda / nuevo rival")
                 transition("IN_COMBAT")
             end
@@ -618,9 +747,11 @@ local function tick_fsm(st)
             hp_stable_count = 0
         end
 
+        -- Contador de game over: aplica siempre (blanka ganó O perdió)
+        -- Si los HP no suben → countdown → GAME_OVER
         local any_hp_rising = (st.p1_hp > prev_p1_hp or st.p2_hp > prev_p2_hp)
         if any_hp_rising then
-            ko_frames = 0
+            ko_frames = 0   -- hay actividad de HP → resetear contador
         else
             ko_frames = ko_frames + 1
             if ko_frames >= KO_GAME_OVER_N then
@@ -631,6 +762,7 @@ local function tick_fsm(st)
             end
         end
 
+        -- Safety timeout absoluto (muy holgado, nunca debería dispararse)
         if sm_frame >= 4000 then
             print("[AB v2.3] TIMEOUT ROUND_OVER (4000f) -> forzar GAME_OVER")
             ko_frames = 0; hp_stable_count = 0
@@ -638,23 +770,49 @@ local function tick_fsm(st)
         end
 
     -- =========================================================================
-    elseif sm_state == "GAME_OVER" then
+elseif sm_state == "GAME_OVER" then
     -- =========================================================================
+    -- Blanka ha perdido el enfrentamiento completo.
+    -- SF2CE muestra la pantalla de countdown (9s).
+    -- Necesitamos:
+    --   1. Insertar 1 moneda (para poder continuar)
+    --   2. Pulsar Start (para aceptar el continue)
+    --   3. El juego lleva el cursor a Blanka automáticamente
+    --   4. Confirmar con JAB
+    --
+    -- Protocolo event-driven:
+    --   - Moneda en sm_frame==1 (inmediatamente al entrar)
+    --   - Start repetido cada 20 frames hasta que el juego responda
+    --   - "Juego respondió" = HP vuelve a subir (char confirm detectado arriba)
+    --     O sm_frame >= umbral máximo → forzar CHAR_CONFIRM
+
         if sm_frame == 1 then
             hold(BTN_COIN)
         elseif sm_frame == 5 then
             release(BTN_COIN)
         end
 
+        -- Pulsar Start repetidamente para aceptar el continue
+        -- (el juego acepta Start en la pantalla de countdown y en el char select)
         if sm_frame >= 10 and sm_frame % 15 == 0 then
             hold(BTN_START)
         elseif sm_frame >= 10 and sm_frame % 15 == 5 then
             release(BTN_START)
         end
 
+        -- Después de insertar coin + Start, el juego va al char select
+        -- con Blanka preseleccionado. Esperamos un tiempo mínimo para
+        -- que el juego procese (120 frames = ~2s a 60fps, muy rápido a alta vel).
         if sm_frame >= 120 then
-            is_continue     = true
+            is_continue     = true   -- Blanka ya preseleccionado
             hp_stable_count = 0
+            
+            -- Reset completo de marcador al usar continue
+            match_p1_wins = 0
+            match_p2_wins = 0
+            match_over    = false
+            round_result  = "none"
+            
             transition("CHAR_CONFIRM")
         end
     end
@@ -666,33 +824,41 @@ end
 local function on_frame()
     frame_count = frame_count + 1
 
+    -- Resolver instance ID si aún no está listo
     if not _id_resolved then
         ensure_instance_id()
         if _id_resolved then refresh_paths(); write_ver_file() end
     end
     if not _ver_written then write_ver_file() end
 
+    -- Intentar inicializar hardware
     try_init()
 
+    -- Leer estado del juego
     local st = read_game_state()
 
+    -- Escribir state.txt para Python
     write_state(st)
 
+    -- Tick de la FSM
     tick_fsm(st)
 
+    -- Actualizar HP previo para detección de flancos en ROUND_OVER
     prev_p1_hp = st.p1_hp
     prev_p2_hp = st.p2_hp
 
+    -- Flush de inputs al hardware
     flush_inputs()
 
+    -- Log periódico de diagnóstico (cada 600 frames)
     if frame_count % 600 == 0 then
-        print(string.format("[AB v2.3 ID%d] estado=%s smf=%d P1HP=%d P2HP=%d wr=%d cont=%s wt=%d",
+        print(string.format("[AB v2.2 ID%d] estado=%s smf=%d P1HP=%d P2HP=%d wr=%d cont=%s",
             INSTANCE_ID or 0, sm_state, sm_frame, st.p1_hp, st.p2_hp,
-            diag_write_ok, bts(is_continue), wait_timeout_count))
+            diag_write_ok, bts(is_continue)))
     end
 end
 
 emu.register_frame_done(on_frame, "frame")
 
-print("[AB v2.3] Iniciado - FSM event-driven, sin tiempos hardcodeados")
-print("[AB v2.3] FIX: anti-bucle WAIT_COMBAT (max " .. WAIT_TIMEOUT_MAX .. " timeouts -> INSERT_COIN)")
+print("[AB v2.2] Iniciado - FSM event-driven, sin tiempos hardcodeados")
+print("[AB v2.2] Fix: CHAR_CONFIRM solo JAB | WAIT_COMBAT espera HP | is_continue preservado")
