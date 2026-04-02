@@ -6,7 +6,10 @@ Se actualiza al final de cada combate individual y se persiste en JSON.
 
 Archivo: C:/proyectos/MAME/rival_stats.json
 
-v2.0 (30/03/2026):
+v2.1 (01/04/2026):
+  · Fix WinError 32: os.replace() con retry (5 intentos, backoff 0.1s).
+    Con 6 procesos paralelos en Windows, el rename atómico puede fallar
+    si otro proceso está leyendo el .tmp en ese instante.
   · Guarda cada 5 episodios por rival (antes era 10)
   · Guarda también cada 50 episodios globales
   · El contador global se expone para que train.py lo use en Ctrl+C
@@ -67,8 +70,20 @@ class RivalRegistry:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({str(k): v for k, v in self._stats.items()},
                           f, indent=2, ensure_ascii=False)
-            # Escritura atómica: renombrar solo si el write fue bien
-            os.replace(tmp, self._path)
+            # [v2.1] Escritura atómica con retry para WinError 32.
+            # Con 6 procesos paralelos en Windows, os.replace() puede fallar
+            # si otro proceso tiene el .tmp abierto en ese instante exacto.
+            # 5 intentos con backoff exponencial de 0.1s, 0.2s, 0.3s...
+            last_err = None
+            for attempt in range(5):
+                try:
+                    os.replace(tmp, self._path)
+                    return  # éxito → salir
+                except OSError as e:
+                    last_err = e
+                    time.sleep(0.1 * (attempt + 1))
+            # Si todos los intentos fallaron, reportar el último error
+            print(f"[RivalRegistry] ERROR guardando tras 5 intentos: {last_err}")
         except Exception as e:
             print(f"[RivalRegistry] ERROR guardando: {e}")
 

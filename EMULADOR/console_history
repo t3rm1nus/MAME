@@ -15,4 +15,3 @@ m=manager.machine.devices[":maincpu"].spaces["program"]; for a=0xFF8000,0xFF9000
   m=manager.machine.devices[":maincpu"].spaces["program"]; for a=0xFF8000,0xFF9000 do local v=m:read_u8(a) if v>=1 and v<=11 then print(string.format("0x%06X=%d",a,v)) end end
 m=manager.machine.devices[":maincpu"].spaces["program"]; for a=0xFF8000,0xFF9000 do local v=m:read_u8(a) if v>=1 and v<=11 then print(string.format("0x%06X=%d",a,v)) end end
 print(emu.app_version())
-

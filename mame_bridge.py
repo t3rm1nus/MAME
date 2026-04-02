@@ -61,7 +61,8 @@ class MAMEBridge:
                  dyn_dir: Optional[str] = None):
         self.instance_id = instance_id
         self._base       = base_dir
-
+        self.last_st = {}      # <--- Agrega esto
+        self._last_state = {}  # <--- Agrega esto
         # Directorio de archivos dinamicos (puede sobreescribirse)
         _dyn = dyn_dir or os.path.join(base_dir, "dinamicos")
         os.makedirs(_dyn, exist_ok=True)
@@ -166,16 +167,21 @@ class MAMEBridge:
         Envía inputs a MAME y espera el siguiente frame.
         Polling activo: garantiza que cada step() lee exactamente 1 frame nuevo.
         """
+        # 1. Enviar los botones al archivo mame_input_N.txt
         self._write_input(buttons)
+
+        # 2. Esperar mediante polling activo a que el Lua procese el input
+        #    y genere un nuevo state_N.txt con el siguiente frame.
         st = self._wait_new_frame()
+
+        # 3. Persistencia del estado (CRÍTICO para evitar AttributeErrors)
         if st is not None:
-            self._last_state = st
+            self._last_state = st  # Tu variable original
+            self.last_st = st     # La variable que busca blanka_env.py
+        
         return st
 
     def soft_reset(self, timeout: float = 90.0) -> bool:
-        """
-        Espera a que MAME esté en un combate válido (in_combat=True y HP >= MIN_HP_VALID).
-        """
         try:
             with open(self._reset_file, "w", encoding="ascii") as f:
                 f.write("reset\n")
@@ -183,12 +189,26 @@ class MAMEBridge:
             pass
 
         deadline = time.time() + timeout
+        last_log = time.time()
         while time.time() < deadline:
             st = self._parse_state_file()
+            
+            # LOG cada 5 segundos para saber qué está viendo
+            if time.time() - last_log > 5.0:
+                last_log = time.time()
+                elapsed = timeout - (deadline - time.time())
+                if st:
+                    print(f"[MAMEBridge#{self.instance_id}] soft_reset waiting... "
+                        f"{elapsed:.0f}s | in_combat={st.get('in_combat')} "
+                        f"p1_hp={st.get('p1_hp',0)} p2_hp={st.get('p2_hp',0)} "
+                        f"frame={st.get('frame')} gs={st.get('game_state','?')}")
+                else:
+                    print(f"[MAMEBridge#{self.instance_id}] soft_reset waiting... "
+                        f"{elapsed:.0f}s | state_file=None (Lua no escribe)")
+            
             if st:
                 p1 = int(st.get("p1_hp", 0))
                 p2 = int(st.get("p2_hp", 0))
-
                 if "in_combat" in st:
                     if st["in_combat"] and p1 >= MIN_HP_VALID and p2 >= MIN_HP_VALID:
                         try:
@@ -231,15 +251,17 @@ class MAMEBridge:
             print(f"[MAMEBridge] WARN: mame_exe no encontrado: {mame_exe}")
             return False
 
-        cmd = [mame_exe, rom, "-autoboot_script", lua_script]
+        # ESTA LÍNEA ES LA CLAVE:
+        cmd = [mame_exe, rom, "-nosound", "-noini", "-autoboot_script", lua_script]
+        
         if self.instance_id > 0:
             cmd.append("-nothrottle")
 
         try:
             self._mame_proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=None,
+                stderr=None,
                 cwd=os.path.dirname(mame_exe),
             )
             print(f"[MAMEBridge#{self.instance_id}] MAME lanzado (PID {self._mame_proc.pid})")
