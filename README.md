@@ -1,58 +1,228 @@
-# 🕹️ Proyecto MAME RL – Blanka 100% Winrate (SF2CE / MAME 0.286)
+# 🕹️ Proyecto MAME RL – Blanka 100% Winrate (SF2CE)
+
+---
 
 ## 🎯 OBJETIVO FINAL
-Entrenar un agente de IA mediante PPO (Reinforcement Learning) que derrote a la máquina de Street Fighter II': Champion Edition con **100% winrate + perfects** en todos los combates contra la IA determinista.  
-**Enfoque actual**: Blanka.
 
-## ✅ ESTADO ACTUAL (v5.10 - Abril 2026)
+Entrenar un agente mediante **PPO (Reinforcement Learning)** que derrote a la máquina de *Street Fighter II': Champion Edition* con **100% winrate** en modo Arcade.
 
-El framework soporta **entrenamiento multi-instancia concurrente** y transiciones fluidas de Curriculum Learning.
+El sistema utiliza una **Fase Única** con **26 acciones disponibles desde el inicio**.
 
-- **Lua bridge (`lua/autoplay_bridge.lua` v2.3)**: FSM event-driven. Navega los menús de inicio, selección de personaje (Blanka) y bucles de Game Over/Continue de forma 100% autónoma.
-- **Entorno Gymnasium (`env/blanka_env.py` v5.10)**:
-  - **Recompensas moldeadas (Reward Shaping)**: Sistema progresivo de HP, bonus por esquives aéreos (+2.5), y penalización severa por daño recibido (-12.0) para incentivar la defensa.
-  - **Mecanismos Anti-Estancamiento**: Lógica para castigar el "rolling spam" compulsivo sin lograr KOs.
-  - **Tracking Perfecto**: Detección robusta de Game Overs reales y Arcade Clears mediante flancos de HP y FSM, eliminando bugs de truncamiento prematuro.
-- **Entrenamiento (Pipeline)**:
-  - **CL-1 (`train_FASE1.py` v3.2)**: 6 instancias *headless* en paralelo. Espacio de acciones reducido a 7 (Rolling y Electricidad). Ajuste de hiperparámetros (ent_coef=0.05) para romper el colapso de entropía.
-  - **Fase 2 (`train_FASE2.py`)**: Entorno completo con 26 acciones. Carga de pesos parcial (compartiendo `mlp_extractor`) desde la Fase 1.
-- **Bridge Python↔MAME (`mame_bridge.py` v1.3)**: Polling activo, arquitectura optimizada en el directorio `dinamicos/` aislando inputs y states por `instance_id`.
+---
 
-## 🚀 CÓMO ARRANCAR
+## 📂 GUÍA DE ARCHIVOS Y CARPETAS (Índice Técnico)
+
+El proyecto está modularizado para separar:
+
+* Memoria de MAME
+* Motor de entrenamiento
+* Comunicación
+
+
+MAME/
+├── config/              # constants.py (Direcciones RAM, offsets y variables estáticas)
+├── core/                # rival_registry.py (Sistema de guardado de estadísticas)
+├── lua/                 # autoplay_bridge.lua (Inyectado en MAME)
+├── EMULADOR/            # Binarios de MAME 0.286 y roms/
+│
+├── dinamicos/           # [GENERADO AUTOMÁTICAMENTE] - Archivos volátiles
+│   ├── bridge_version_N.txt      # Confirma que el Lua está listo
+│   ├── instance_id_claim.txt     # Sistema de asignación de IDs para multiproceso
+│   ├── mame_input_N.txt          # Python escribe las acciones aquí (CSV: 0,1,0...)
+│   ├── mame_stdout_N.txt         # Logs internos del emulador
+│   └── state_N.txt               # Lua escribe el estado de la RAM (JSON)
+│
+├── logs/blanka/unica/   # [GENERADO AUTOMÁTICAMENTE] - Métricas
+│   └── events.out.tfevents...    # Archivos de TensorBoard (WinRate, daño, etc.)
+│
+├── models/blanka/unica/ # [GENERADO AUTOMÁTICAMENTE] - Pesos Neuronales
+│   ├── unica_75000_steps.zip     # Checkpoints del modelo PPO (guardado cada 75k steps)
+│   ├── unica_final.zip           # Modelo final al terminar / interrumpir (Ctrl+C)
+│   └── vecnorm_unica.pkl         # Normalizador vectorial de observaciones (CRÍTICO)
+│
+└── rival_stats.json     # [GENERADO AUTOMÁTICAMENTE] - Histórico de winrates por personaje
+
+⚠️ **No borres archivos de estas carpetas**, ya que son dependencias críticas.
+
+---
+
+## 📁 `/env` — *El Corazón del Entorno*
+
+Contiene la lógica que transforma el juego en un problema de IA.
+
+* **`blanka_env.py (v5.17)`**
+  Define el entorno Gymnasium. Gestiona:
+
+  * Steps
+  * Reset de combates
+  * Procesamiento de observaciones
+
+* **`reward.py`**
+  Define la "ética" del agente:
+
+  * Recompensas por daño
+  * Penalizaciones por recibir golpes o hacer spam
+
+* **`action_space.py`**
+  Catálogo de las **26 acciones**:
+
+  * Movimientos
+  * Saltos
+  * Macros de Rolling
+
+* **`input_buffer.py` & `move_detector.py`**
+  Micro-lógica:
+
+  * Gestión de cargas (mantener atrás 1s)
+  * Detección de movimientos exitosos
+
+---
+
+## 📁 `/lua` — *El Motor dentro de MAME*
+
+Scripts ejecutados dentro del emulador.
+
+* **`autoplay_bridge.lua (v2.22)`**
+  Script maestro:
+
+  * FSM (Máquina de Estados)
+  * Inserta monedas
+  * Selecciona a Blanka
+  * Lee la RAM
+
+✔️ Es el **único archivo Lua necesario para entrenamiento**.
+
+---
+
+## 📁 `/config` — *La Base de Datos*
+
+* **`constants.py`**
+  Contiene todas las direcciones de memoria (offsets):
+
+  * HP
+  * Tiempo
+  * Posiciones X/Y
+
+💡 Si cambias ROM o versión → **solo editas este archivo**.
+
+---
+
+## 📁 `/core` — *Persistencia*
+
+* **`rival_registry.py`**
+  Gestiona `rival_stats.json`:
+
+  * Registro de victorias/derrotas
+  * Permite *Curriculum Learning automático*
+
+---
+
+## 📁 `/dinamicos` — *Memoria Volátil (I/O)*
+
+Comunicación entre Python y MAME:
+
+* `state_N.txt` → MAME ➜ Python
+* `mame_input_N.txt` → Python ➜ MAME
+
+⚠️ Puedes borrar el contenido, **pero no la carpeta**.
+
+---
+
+## ⚙️ FUNCIONAMIENTO DEL BUCLE DE ENTRENAMIENTO
+
+### 🚀 Lanzamiento
+
+`train_UNICA.py` inicia **N instancias de MAME** (por defecto 6) en modo **nothrottle**.
+
+---
+
+### 🔁 Ciclo de Experiencia (Rollout)
+
+1. MAME escribe estado en `dinamicos/state_N.txt`
+2. `blanka_env.py`:
+
+   * Lee estado
+   * Normaliza datos
+   * Envía a la red PPO
+3. La IA decide acción
+4. Escribe en `dinamicos/mame_input_N.txt`
+5. MAME ejecuta acción
+6. 🔄 Repetir a máxima velocidad
+
+---
+
+### 💾 Datos Guardados
+
+* **Modelos:**
+  `models/` → checkpoints `.zip` cada **75.000 pasos**
+
+* **Normalización:**
+  `vecnorm_unica.pkl` → imprescindible para continuar entrenamiento
+
+* **Estadísticas:**
+  `rival_stats.json` → progreso contra cada rival
+
+---
+
+## 🖥️ CONFIGURACIONES
+
+| Configuración | Rendimiento  | Estabilidad | Notas                       |
+| ------------- | ------------ | ----------- | --------------------------- |
+| 1 Instancia   | Lento        | Alta        | Debug o PCs débiles         |
+| 6 Instancias  | Óptimo       | Alta        | ⭐ Configuración estándar   |
+| Con Throttle  | Muy lento    | Perfecta    | Solo para `watch_blanka.py` |
+| Sin Throttle  | Ultra rápido | Alta        | >500 FPS                    |
+| Con Visión    | Medio        | Media       | Solo Instancia 0 visible    |
+
+---
+
+## 🚀 COMANDOS RÁPIDOS
+
+### 🧹 Limpiar
 
 ```bash
-# 1. Limpieza de memoria temporal antes de empezar
 python limpia.py
+```
 
-# 2. Curriculum Learning Fase 1 (6 instancias headless por defecto)
-python train_FASE1.py --steps 5000000
+---
 
-# 3. Entrenamiento completo Fase 2 (carga parcial de Fase 1)
-# Puede configurarse --envs N para lanzar múltiples instancias
-python train_FASE2.py --resume models/blanka/fase1/fase1_final
+### 🧠 Entrenar (Modo Pro)
 
-# 4. Ver estadísticas de rivales en cualquier momento:
-python train_FASE2.py --stats
+```bash
+python train_UNICA.py --envs 6
+```
 
-📂 ESTRUCTURA DEL PROYECTO REAL
-Plaintext
-MAME/
-├── config/              # constants.py (Direcciones RAM, offsets y settings globales)
-├── core/                # Lógica central, rival_registry.py
-├── dinamicos/           # Archivos temporales de I/O en tiempo real (mame_input_N, state_N)
-├── EMULADOR/            # Binarios de MAME 0.286 y ROMs
-├── env/                 # Entorno Gymnasium (blanka_env.py, reward.py, action_space.py)
-├── logs/                # TensorBoard logs para PPO
-├── lua/                 # Scripts MAME (autoplay_bridge.lua)
-├── models/              # Checkpoints (.zip) y VecNormalize (.pkl) de fase1/fase2
-└── scripts base         # train_FASE1.py, train_FASE2.py, mame_bridge.py, limpia.py
-🎮 ESPACIO DE ACCIONES (26 - Fase 2)
-0-14: Single frame (NOOP, direcciones, botones, combinaciones down+botón)
+---
 
-15-17: Rolling (Fierce, Strong, Jab - Macros completas de 73 frames)
+### 👀 Entrenar y Ver
 
-18: Electricidad
+```bash
+python train_UNICA.py --envs 6 --visible
+```
 
-19-24: Saltos con ataques específicos
+---
 
-25: Rolling Jump (Solo disponible en ventana de aterrizaje LANDING_WINDOW)
+### 🏆 Ver al Campeón
+
+```bash
+python watch_blanka.py
+```
+
+---
+
+### 📊 Ver Estadísticas
+
+```bash
+python train_UNICA.py --stats
+```
+
+---
+
+## ⚠️ AVISO CRÍTICO
+
+El sistema de **Doble Buffer (v5.17)** evita que el entrenamiento se rompa cuando MAME corre más rápido que Python.
+
+🚫 **NO modifiques los tiempos de espera en `mame_bridge.py`**
+a menos que experimentes cierres inesperados.
+
+---

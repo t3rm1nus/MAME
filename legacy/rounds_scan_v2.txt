@@ -1,0 +1,15 @@
+-- Inicia diagnóstico estricto de rondas --
+
+--- DIFF ROUND FINALIZADO (Frame 2870) ---
+  >> CANDIDATO IDEAL: 0xFF8036 cambió de 0 a 1
+  >> CANDIDATO IDEAL: 0xFF8064 cambió de 1 a 2
+  >> CANDIDATO IDEAL: 0xFF8302 cambió de 0 a 1
+  >> CANDIDATO IDEAL: 0xFF833A cambió de 0 a 1
+  >> CANDIDATO IDEAL: 0xFF864E cambió de 0 a 1
+  >> CANDIDATO IDEAL: 0xFF8659 cambió de 0 a 1
+  >> CANDIDATO IDEAL: 0xFF89C4 cambió de 0 a 1
+  >> CANDIDATO IDEAL: 0xFF8A3F cambió de 0 a 1
+  >> CANDIDATO IDEAL: 0xFF8A41 cambió de 0 a 1
+  >> CANDIDATO IDEAL: 0xFF8A42 cambió de 0 a 1
+  >> CANDIDATO IDEAL: 0xFF8A46 cambió de 0 a 1
+  >> CANDIDATO IDEAL: 0xFF8A49 cambió de 0 a 1

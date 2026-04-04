@@ -2,83 +2,47 @@
 """
 train_FASE1.py — SF2CE PPO Blanka | CL-1 Multi-Env (6 instancias headless)
 ===========================================================================
-Versión: 3.1 (01/04/2026)
+Versión: 3.3 (04/04/2026)
 
-CAMBIOS v3.1 — HIPERPARÁMETROS PPO CORREGIDOS PARA ROMPER COLAPSO DE ENTROPÍA:
+CAMBIOS v3.3 — FIX 7 + FIX 8 (complementarios a blanka_env.py v5.17)
 
-  PROBLEMA (v3.0):
-    A 470k steps el agente tenía 0 rolling_uses, 0 electric_uses, entropía -1.86
-    (colapsada desde distribución uniforme -1.95 para 7 acciones) y
-    avg_p2_damage=72 constante. La política había convergido prematuramente a
-    2 acciones (NOOP + un movimiento) sin explorar Rolling ni Electric.
+  FIX 7 — MetricsCallback: avg_p2_damage usaba p2_hp del info dict de forma
+    ambigua. Tras el swap de v5.12, p2_hp en el info dict es el HP del rival
+    (correcto internamente), pero MetricsCallback calculaba:
+      max(0.0, 144.0 - float(p2hp))
+    usando la clave "p2_hp" que ANTES del swap era el HP de Blanka, no del
+    rival. Resultado: la métrica mostraba siempre ~141 (daño recibido por
+    Blanka = 144 - 3) en lugar del daño infligido al rival.
 
-    Causa raíz: rollout de 24.576 steps (6×4096) a 710 FPS = ~34 segundos de
-    experiencia por update. Con ent_coef=0.03, la entropía cae en los primeros
-    2-3 updates antes de que el agente vea suficiente variedad para aprender.
-    batch_size=128 con 24.576 steps = 192 minibatches → overfitting rápido.
+    FIX: MetricsCallback ahora usa la clave "rival_hp" añadida en v5.17
+    al info dict, que es inequívocamente el HP del rival post-swap.
+    Fallback a "p2_hp" para compatibilidad con checkpoints anteriores.
 
-  CORRECCIONES:
-    · ent_coef: 0.03 → 0.05
-      Aumenta el incentivo de exploración un 67%. Con 7 acciones CL-1,
-      la entropía máxima es ln(7)≈1.95. A 0.05, el término de entropía
-      contribuye ~0.097 al loss, suficiente para resistir colapso prematuro.
+  FIX 8 — _wait_for_state_files: Además de verificar que el state file
+    tiene contenido, ahora verifica que el contenido incluye "in_combat"
+    (indicador de que el Lua está en estado de juego real, no en menú).
+    Evita que launch_all confirme un state de pantalla de título o
+    selección de personaje a nothrottle, que causaba que reset() esperase
+    hasta su propio timeout de 120s.
 
-    · n_steps: 4096 → 2048
-      Rollout efectivo: 6×2048 = 12.288 steps por update (vs 24.576).
-      A 710 FPS: ~17 segundos de experiencia por update.
-      Más updates = la política recibe corrección antes de colapsar.
+CAMBIOS v3.2 (mantenidos):
+  · Wait dinámico en launch_all() reemplazando sleep(3.0) fijo.
+  · Poll activo hasta que todos los state_N.txt tienen contenido.
+  · Timeout de 90s con log cada 10s.
 
-    · batch_size: 128 → 256
-      Con 12.288 steps y batch=256: 48 minibatches por update (vs 192).
-      Reduce el overfitting por update. El gradiente ve más variedad.
-
-    · n_epochs: 4 → 10
-      Más épocas sobre cada rollout para extraer más aprendizaje por
-      experiencia colectada. Compensado por el batch más grande.
-
-    · target_kl: 0.02 → 0.01
-      Freno más conservador para que la política no se aleje demasiado.
-      Con ent_coef alto, es importante evitar updates demasiado agresivos.
-
-    · learning_rate nuevo: 1e-4 (en lugar de 3e-4 para modelos nuevos)
-      Con ent_coef alto y rollout corto, lr=3e-4 puede causar inestabilidad.
-
-DESCRIPCIÓN (mantenida de v3.0):
-  Clon EXACTO de train_blanka_v1.py (Fase 2) adaptado para ejecutar
-  6 instancias de MAME en paralelo, todas headless por defecto.
-
-  Los únicos cambios respecto a train_blanka_v1.py son:
-    · N_ENVS = 6  (SubprocVecEnv en lugar de DummyVecEnv)
-    · Lanzamiento multi-instancia con protocolo claim (launch_all)
-    · Todos los procesos MAME sin ventana por defecto (-nothrottle + -video none)
-    · --visible (flag opcional) muestra la instancia 0 con ventana
-    · Rutas apuntan a models/blanka/fase1  y  logs/blanka/fase1
+CAMBIOS v3.1 (mantenidos):
+  · ent_coef: 0.03 → 0.05
+  · n_steps:  4096 → 2048
+  · batch_size: 128 → 256
+  · n_epochs: 4 → 10
+  · target_kl: 0.02 → 0.01
 
 USO:
-  # Entrenamiento nuevo (6 MAMEs headless):
   python train_FASE1.py
-
-  # Con instancia 0 visible (para supervisión):
   python train_FASE1.py --visible
-
-  # Solo 2 instancias:
   python train_FASE1.py --envs 2
-
-  # Reanudar desde checkpoint:
   python train_FASE1.py --resume models/blanka/fase1/fase1_999912_steps
-
-  # Ver resumen de rivales:
   python train_FASE1.py --stats
-
-FLUJO AUTOMÁTICO:
-  1. Limpia archivos dinámicos de sesión anterior
-  2. Lanza N instancias de MAME secuencialmente (protocolo claim)
-  3. Cada instancia obtiene su instance_id único via claim file
-  4. El Lua navega menús y selecciona Blanka automáticamente en cada instancia
-  5. SubprocVecEnv sincroniza los 6 entornos en paralelo
-  6. El agente PPO juega runs de arcade continuas en los 6 MAMEs
-  7. Checkpoints automáticos cada 8192 steps en models/blanka/fase1/
-  8. Al terminar (Ctrl+C o steps agotados): guarda modelo, VecNorm y stats
 """
 
 import argparse
@@ -102,12 +66,12 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 from env.blanka_env import (
     BlankaEnv, CHAR_NAMES, ROLLING_ACTIONS, ACTION_ELECTRIC,
-    BOSS_IDS, BOSS_ORDER, ARCADE_FINAL_BOSS,
+    BOSS_IDS, BOSS_ORDER, ARCADE_FINAL_BOSS, MAX_HP,
 )
 from core.rival_registry import RivalRegistry
 
 # ── CONFIG MULTI-ENV ──────────────────────────────────────────────────────────
-N_ENVS = 6          # instancias MAME por defecto
+N_ENVS = 6
 
 # ── RUTAS ─────────────────────────────────────────────────────────────────────
 MAME_DIR   = r"C:\proyectos\MAME"
@@ -131,43 +95,36 @@ def input_file(i):    return os.path.join(DYN_DIR, f"mame_input_{i}.txt")
 def state_file(i):    return os.path.join(DYN_DIR, f"state_{i}.txt")
 def state_tmp(i):     return os.path.join(DYN_DIR, f"state_{i}.tmp")
 
-# ── ACCIONES (igual que train_blanka_v1.py) ───────────────────────────────────
+# ── ACCIONES ──────────────────────────────────────────────────────────────────
 ACTION_ROLLING_FIERCE = 15
 ACTION_ROLLING_STRONG = 16
 ACTION_ROLLING_JAB    = 17
 ACTION_ELECTRIC_ID    = 18
 ACTION_ROLLING_JUMP   = 25
 
-# ── HIPERPARÁMETROS PPO — v3.1 (anti-colapso de entropía) ────────────────────
-# Cambios respecto a v3.0:
-#   ent_coef:   0.03  → 0.05  (más exploración, resistir colapso prematuro)
-#   n_steps:    4096  → 2048  (rollout más corto → más updates → corrección antes)
-#   batch_size: 128   → 256   (menos minibatches por update → menos overfitting)
-#   n_epochs:   4     → 10    (más aprovechamiento de cada rollout)
-#   target_kl:  0.02  → 0.01  (freno más fino con ent_coef alto)
-# Rollout efectivo: 6 envs × 2048 = 12.288 steps por update
+# ── HIPERPARÁMETROS PPO — v3.1 ────────────────────────────────────────────────
 PPO_HPARAMS = dict(
-    n_steps       = 2048,    # 6 envs × 2048 = 12.288 steps por rollout
+    n_steps       = 2048,
     batch_size    = 256,
     n_epochs      = 10,
     gamma         = 0.99,
     gae_lambda    = 0.95,
     clip_range    = 0.2,
-    ent_coef      = 0.05,    # v3.1: 0.03 → 0.05
+    ent_coef      = 0.05,
     vf_coef       = 0.5,
     max_grad_norm = 0.5,
-    target_kl     = 0.01,    # v3.1: 0.02 → 0.01
+    target_kl     = 0.01,
     policy_kwargs = dict(net_arch=[256, 256]),
     verbose       = 1,
     tensorboard_log = LOGS_DIR,
 )
 
 # ── BOSS TRACKING ─────────────────────────────────────────────────────────────
-_BOSS_ORDER = [10, 11, 9, 8]   # Balrog, Vega, Sagat, Bison
+_BOSS_ORDER = [10, 11, 9, 8]
 _BOSS_KEY   = {10: "balrog", 11: "vega", 9: "sagat", 8: "bison"}
 
 
-# ── LIMPIEZA DE ARCHIVOS PREVIOS ──────────────────────────────────────────────
+# ── LIMPIEZA ──────────────────────────────────────────────────────────────────
 
 def _try_remove(path: str) -> bool:
     if not os.path.exists(path):
@@ -180,7 +137,6 @@ def _try_remove(path: str) -> bool:
 
 
 def clean_all(n: int):
-    """Elimina archivos de sesión anterior para evitar colisiones de IDs."""
     targets = [CLAIM_FILE]
     for i in range(n):
         targets += [ver_file(i), claimed_file(i),
@@ -193,22 +149,13 @@ def clean_all(n: int):
 # ── LANZAR UNA INSTANCIA MAME ─────────────────────────────────────────────────
 
 def launch_one(instance_id: int, visible: bool = False) -> Optional[subprocess.Popen]:
-    """
-    Lanza una instancia MAME con el protocolo claim.
-
-    El Lua lee CLAIM_FILE, adopta ese instance_id y escribe
-    instance_id_claimed_N.txt para confirmar. Luego escribe
-    bridge_version_N.txt cuando el bridge está listo.
-    """
     if not os.path.exists(MAME_EXE):
         print(f"[MAME-{instance_id}] ERROR: no existe {MAME_EXE}")
         return None
 
-    # Limpiar claim y archivos de esta instancia
     for f in [CLAIM_FILE, claimed_file(instance_id), ver_file(instance_id)]:
         _try_remove(f)
 
-    # Escribir claim
     try:
         with open(CLAIM_FILE, "w") as f:
             f.write(str(instance_id))
@@ -223,19 +170,21 @@ def launch_one(instance_id: int, visible: bool = False) -> Optional[subprocess.P
         "-rompath",         os.path.join(MAME_DIR, "EMULADOR", "roms"),
         "-autoboot_script", LUA_SCRIPT,
         "-skip_gameinfo",
+        "-nothrottle",
         "-sound", "none",
+        "-console",
         "-video", video,
     ]
-    if not visible:
-        cmd += ["-nothrottle"]
-    else:
+    if visible:
         cmd += ["-window", "-nomaximize"]
 
-    print(f"[MAME-{instance_id}] Lanzando video={video} throttle={visible}...")
+    print(f"[MAME-{instance_id}] Lanzando video={video}...")
     try:
+        log_path = os.path.join(DYN_DIR, f"mame_stdout_{instance_id}.txt")
+        log_f = open(log_path, "w")
         proc = subprocess.Popen(
             cmd, cwd=os.path.dirname(MAME_EXE),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=log_f, stderr=log_f,
         )
         print(f"[MAME-{instance_id}] PID={proc.pid}")
     except Exception as e:
@@ -282,6 +231,73 @@ def launch_one(instance_id: int, visible: bool = False) -> Optional[subprocess.P
     return proc
 
 
+def _wait_for_state_files(procs: List[subprocess.Popen], n: int,
+                           timeout: float = 90.0):
+    """
+    v3.3 FIX 8: Espera dinámica hasta que todos los state_N.txt existen,
+    tienen contenido Y ese contenido incluye la clave "in_combat", que
+    garantiza que el Lua está en estado de juego real (no en menú ni
+    pantalla de título).
+
+    A nothrottle el juego puede estar escribiendo el state del menú de
+    selección de personaje antes de entrar en combate. Verificar "in_combat"
+    en el contenido evita que launch_all confirme un state inválido y que
+    reset() tenga que esperar hasta su propio timeout de 120s.
+    """
+    print(f"\n  [WAIT] Esperando state files de {n} instancias (timeout={timeout:.0f}s)...")
+    t0       = time.time()
+    deadline = t0 + timeout
+    confirmed = [False] * n
+    last_log  = t0
+
+    while time.time() < deadline:
+        for i in range(n):
+            if confirmed[i]:
+                continue
+            # Verificar que el proceso sigue vivo
+            if procs[i].poll() is not None:
+                print(f"  [WAIT] ⚠️  MAME-{i} ha muerto inesperadamente")
+                confirmed[i] = True   # lo marcamos para no bloquear
+                continue
+            sf = state_file(i)
+            if os.path.exists(sf):
+                try:
+                    with open(sf, "r") as f:
+                        content = f.read().strip()
+                    # FIX 8: verificar que es un state de juego real,
+                    # no de menú. La presencia de "in_combat" indica que
+                    # el Lua está en el loop principal de combate.
+                    if content and "in_combat" in content:
+                        elapsed = time.time() - t0
+                        print(f"  [WAIT] MAME-{i} state de combate listo ({elapsed:.1f}s) ✓")
+                        confirmed[i] = True
+                    elif content:
+                        # Tiene contenido pero no in_combat: menú o transición
+                        pass  # seguir esperando
+                except Exception:
+                    pass
+
+        if all(confirmed):
+            total = time.time() - t0
+            print(f"  [WAIT] Todos los bridges en combate ({total:.1f}s) ✓")
+            return
+
+        # Log de progreso cada 10 segundos
+        now = time.time()
+        if now - last_log >= 10.0:
+            last_log = now
+            pending = [i for i, c in enumerate(confirmed) if not c]
+            elapsed = now - t0
+            print(f"  [WAIT] {elapsed:.0f}s — esperando instancias en combate: {pending}")
+
+        time.sleep(0.2)
+
+    # Timeout: continuar con advertencia (reset() absorbe el resto)
+    not_ready = [i for i, c in enumerate(confirmed) if not c]
+    print(f"  [WAIT] ⚠️  Timeout {timeout:.0f}s — instancias sin state de combate: {not_ready}")
+    print(f"  [WAIT]    reset() esperará hasta 120s adicionales por cada env")
+
+
 def launch_all(n: int, visible_first: bool = False) -> List[subprocess.Popen]:
     """Lanza N instancias MAME secuencialmente con el protocolo claim."""
     procs = []
@@ -303,8 +319,10 @@ def launch_all(n: int, visible_first: bool = False) -> List[subprocess.Popen]:
             time.sleep(1.0)
 
     print(f"\n[LAUNCH] {len(procs)}/{n} instancias activas ✓")
-    print("  3s extra para que los menús arranquen...")
-    time.sleep(3.0)
+
+    # v3.3: wait dinámico con validación de state de combate real
+    _wait_for_state_files(procs, n, timeout=90.0)
+
     return procs
 
 
@@ -348,7 +366,12 @@ class CheckpointVN(BaseCallback):
 class MetricsCallback(BaseCallback):
     """
     Métricas en consola + TensorBoard por rollout.
-    Prefijo sf2/. Adaptado para SubprocVecEnv (lista de infos por step).
+    Prefijo sf2/. Adaptado para SubprocVecEnv.
+
+    v3.3 FIX 7: avg_p2_damage ahora usa info["rival_hp"] (clave añadida en
+    blanka_env.py v5.17) en lugar de info["p2_hp"], que era ambigua tras el
+    swap de v5.12 y mostraba el daño recibido por Blanka en lugar del daño
+    infligido al rival.
     """
 
     def __init__(self, registry: RivalRegistry, verbose: int = 1):
@@ -375,30 +398,24 @@ class MetricsCallback(BaseCallback):
         self._rival_eps: dict = {}
         self._max_rivals_ep  = 0
 
-        # ── boss tracking ──────────────────────────────────────────────────
         self._boss_eps: dict      = {bid: 0 for bid in _BOSS_ORDER}
         self._boss_first_ep: dict = {}
         self._any_boss_eps        = 0
         self._max_bosses_ep       = 0
 
-        # ── arcade clears ──────────────────────────────────────────────────
         self._arcade_clears             = 0
         self._arcade_first_ep: Optional[int] = None
 
-        # ── bonus stages ───────────────────────────────────────────────────
         self._bonus_stage_eps           = 0
         self._bonus_first_ep: Optional[int] = None
 
-        # último rival visto (para el log)
         self._last_rival = 0xFF
 
     def _on_step(self) -> bool:
-        # SubprocVecEnv devuelve una lista de infos (uno por env)
         infos = self.locals.get("infos", [{}])
 
         for info in infos:
             action      = info.get("action",      -1)
-            p2hp        = info.get("p2_hp",       144.0)
             fk_land     = info.get("fk_land",     0)
             rival       = info.get("rival",       0xFF)
             self._last_rival = rival
@@ -420,16 +437,23 @@ class MetricsCallback(BaseCallback):
                 bosses_count  = info.get("bosses_reached_count",   0)
                 arcade_clear  = info.get("arcade_cleared",         False)
 
+                # ── v3.3 FIX 7: usar rival_hp para calcular daño infligido ──
+                # rival_hp es el HP final del rival al terminar el episodio.
+                # Si el rival fue KOed → rival_hp≈0 → daño≈144.
+                # Si Blanka perdió → rival_hp>0 → daño<144.
+                # Fallback a "p2_hp" para compatibilidad con checkpoints v5.16.
+                rival_hp_final = float(info.get("rival_hp", info.get("p2_hp", MAX_HP)))
+                ep_p2_dmg      = max(0.0, MAX_HP - rival_hp_final)
+
                 self._ep_count += 1
                 self._ep_wins.append(1 if won else 0)
                 self._ep_lens.append(ep.get("l", 0))
-                self._ep_p2dmg.append(max(0.0, 144.0 - float(p2hp)))
+                self._ep_p2dmg.append(ep_p2_dmg)
                 self._ep_rivals_def.append(rivals_def)
 
                 if rival <= 11:
                     self._rival_eps[rival] = self._rival_eps.get(rival, 0) + 1
 
-                # ── récord rivales ─────────────────────────────────────────
                 if rivals_def > self._max_rivals_ep:
                     self._max_rivals_ep = rivals_def
                     rname = CHAR_NAMES.get(rival, f"ID_{rival}")
@@ -438,7 +462,6 @@ class MetricsCallback(BaseCallback):
                         f" | último: {rname} | steps={self.num_timesteps:,}"
                     )
 
-                # ── bonus stage ────────────────────────────────────────────
                 if reached_bonus:
                     self._bonus_stage_eps += 1
                     if self._bonus_first_ep is None:
@@ -448,10 +471,8 @@ class MetricsCallback(BaseCallback):
                             f" | steps={self.num_timesteps:,}"
                         )
 
-                # ── bosses ─────────────────────────────────────────────────
                 if bosses_count > 0:
                     self._any_boss_eps += 1
-
                     if bosses_count > self._max_bosses_ep:
                         self._max_bosses_ep = bosses_count
                         bnames = [CHAR_NAMES.get(b, f"ID_{b}") for b in bosses_ids]
@@ -459,7 +480,6 @@ class MetricsCallback(BaseCallback):
                             f"\n[🏆 RÉCORD BOSSES] {bosses_count} bosses en 1 ep"
                             f" | {bnames} | steps={self.num_timesteps:,}"
                         )
-
                     for boss_id in bosses_ids:
                         self._boss_eps[boss_id] = self._boss_eps.get(boss_id, 0) + 1
                         if boss_id not in self._boss_first_ep:
@@ -470,7 +490,6 @@ class MetricsCallback(BaseCallback):
                                 f" ep={self._ep_count} | steps={self.num_timesteps:,}"
                             )
 
-                # ── arcade clear ───────────────────────────────────────────
                 if arcade_clear:
                     self._arcade_clears += 1
                     if self._arcade_first_ep is None:
@@ -486,11 +505,9 @@ class MetricsCallback(BaseCallback):
                             f" ep={self._ep_count} | steps={self.num_timesteps:,}"
                         )
 
-                # ── victorias ──────────────────────────────────────────────
                 if won:
                     if t_w: self._timeout_wins += 1
                     else:   self._ko_wins      += 1
-
                     if not self._first_win:
                         self._first_win = True
                         rname    = CHAR_NAMES.get(rival, f"ID_{rival}")
@@ -531,7 +548,6 @@ class MetricsCallback(BaseCallback):
         print(f"  Electric       : {self._elec_uses} usos")
         print(f"  Roll-Jump      : {self._rjump_uses} usos")
 
-        # ── bosses ────────────────────────────────────────────────────────
         print(f"  ── BOSSES ─────────────────────────────────────────────")
         for boss_id in _BOSS_ORDER:
             bname  = CHAR_NAMES[boss_id]
@@ -557,7 +573,6 @@ class MetricsCallback(BaseCallback):
         print(f"  Rival actual   : {rname}")
         print(f"{'─'*65}")
 
-        # ── TensorBoard ───────────────────────────────────────────────────
         self.logger.record("sf2/win_rate",            wr)
         self.logger.record("sf2/ko_wins",             self._ko_wins)
         self.logger.record("sf2/timeout_wins",        self._timeout_wins)
@@ -613,7 +628,6 @@ class MetricsCallback(BaseCallback):
 
 def make_env(instance_id: int, registry: RivalRegistry):
     def _init():
-        # v3.2: cl1_mode=True → 7 acciones CL-1 (explícito, no depende de la constante global)
         env = BlankaEnv(instance_id=instance_id, max_steps=30000,
                         registry=registry, cl1_mode=True)
         env = Monitor(env, os.path.join(LOGS_DIR, f"monitor_{instance_id}"))
@@ -640,13 +654,10 @@ def train(resume_path: Optional[str] = None,
     print(f"  Visible  : {'instancia 0' if visible else 'todas headless'}")
     print(f"  Modelos  : {MODELS_DIR}")
     print(f"  Logs     : {LOGS_DIR}")
-    print(f"  ent_coef : {PPO_HPARAMS['ent_coef']}  (v3.1: anti-colapso)")
+    print(f"  ent_coef : {PPO_HPARAMS['ent_coef']}")
     print(f"  n_steps  : {PPO_HPARAMS['n_steps']}  → rollout={n_envs * PPO_HPARAMS['n_steps']:,}")
-    print(f"  Flujo    : episodio termina solo por ARCADE CLEAR o MAX_STEPS")
-    print(f"             el Lua pulsa Continue automáticamente al perder")
     print("="*65)
 
-    # ── LANZAR MAMEs ──────────────────────────────────────────────────────────
     if procs is None:
         print(f"\n[0/4] Limpiando archivos previos en dinamicos/...")
         clean_all(n_envs)
@@ -658,12 +669,10 @@ def train(resume_path: Optional[str] = None,
             sys.exit(1)
         print(f"      {len(procs)} MAMEs OK\n")
 
-    # ── REGISTRO ──────────────────────────────────────────────────────────────
     print("[2/4] Cargando registro de rivales...")
     registry = RivalRegistry(STATS_FILE)
     registry.print_summary()
 
-    # ── ENTORNO ───────────────────────────────────────────────────────────────
     print(f"[3/4] Creando {n_envs} entornos SubprocVecEnv...")
     vec_env = SubprocVecEnv(
         [make_env(i, registry) for i in range(n_envs)],
@@ -682,7 +691,6 @@ def train(resume_path: Optional[str] = None,
             clip_obs=10.0, clip_reward=10.0, gamma=0.99,
         )
 
-    # ── MODELO PPO ────────────────────────────────────────────────────────────
     print("[4/4] Preparando modelo PPO...")
     if not is_new:
         print(f"      Cargando pesos desde: {resume_path}")
@@ -704,13 +712,12 @@ def train(resume_path: Optional[str] = None,
     params = sum(p.numel() for p in model.policy.parameters())
     print(f"      Parámetros: {params:,}\n")
 
-    ckpt_cb    = CheckpointVN(8192, MODELS_DIR, "fase1", VN_PATH)
+    ckpt_cb    = CheckpointVN(100000, MODELS_DIR, "fase1", VN_PATH)
     metrics_cb = MetricsCallback(registry=registry, verbose=1)
 
     print(f"Iniciando entrenamiento ({total_steps:,} steps, {n_envs} envs)...")
     print(f"  Rollout efectivo  : {n_envs} × {PPO_HPARAMS['n_steps']} = {n_envs * PPO_HPARAMS['n_steps']:,} steps")
-    print(f"  Episodio = run arcade completa hasta ARCADE CLEAR o MAX_STEPS")
-    print(f"  Game Over → Lua pulsa Continue → mismo episodio continúa\n")
+    print(f"  Episodio = 1 match (best-of-3). Monitor dispara en cada match_over.")
     print(f"  TensorBoard: tensorboard --logdir {LOGS_DIR}\n")
 
     t0 = time.time()
@@ -724,7 +731,6 @@ def train(resume_path: Optional[str] = None,
     except KeyboardInterrupt:
         print("\n[CTRL+C] Interrumpido. Guardando modelo y stats...")
 
-    # ── GUARDADO FINAL ────────────────────────────────────────────────────────
     elapsed   = time.time() - t0
     final_mdl = os.path.join(MODELS_DIR, "fase1_final")
     model.save(final_mdl)
@@ -758,7 +764,6 @@ def train(resume_path: Optional[str] = None,
     except Exception:
         pass
 
-    # ── TERMINAR MAMEs ────────────────────────────────────────────────────────
     print("\n[CLEANUP] Terminando instancias MAME...")
     for i, p in enumerate(procs):
         try:
@@ -767,7 +772,7 @@ def train(resume_path: Optional[str] = None,
         except Exception:
             pass
 
-    print(f"\n  Para Fase 2 (arcade completo, 1 env visible):")
+    print(f"\n  Para Fase 2:")
     print(f"    python train_blanka_v1.py --resume {final_mdl}")
 
 
@@ -776,29 +781,21 @@ def train(resume_path: Optional[str] = None,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=f"SF2CE PPO Blanka — Fase 1 Multi-Env ({N_ENVS} instancias headless)")
-    parser.add_argument("--resume", type=str, default=None,
-        help="Checkpoint previo (sin .zip)")
-    parser.add_argument("--lr", type=float, default=None,
-        help="Learning rate (default: 1e-4)")
-    parser.add_argument("--steps", type=int, default=5_000_000,
-        help="Total steps (default: 5M)")
-    parser.add_argument("--envs", type=int, default=N_ENVS,
-        help=f"Número de instancias MAME (default {N_ENVS})")
-    parser.add_argument("--visible", action="store_true", default=False,
-        help="Instancia 0 con ventana visible (las demás siguen headless)")
-    parser.add_argument("--stats", action="store_true", default=False,
-        help="Mostrar estadísticas de rivales y salir")
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--lr",    type=float, default=None)
+    parser.add_argument("--steps", type=int,   default=5_000_000)
+    parser.add_argument("--envs",  type=int,   default=N_ENVS)
+    parser.add_argument("--visible",  action="store_true", default=False)
+    parser.add_argument("--stats",    action="store_true", default=False)
     args = parser.parse_args()
 
     if args.stats:
         RivalRegistry(STATS_FILE).print_summary()
         sys.exit(0)
 
-    # v3.1: lr por defecto siempre 1e-4 (antes era 3e-4 para nuevo, 1e-4 para resume)
-    # Con ent_coef=0.05, lr=3e-4 puede causar inestabilidad en los primeros updates.
     lr = args.lr if args.lr is not None else 1e-4
     if args.lr is None:
-        print(f"[INFO] lr automático = {lr}  (v3.1: siempre 1e-4)")
+        print(f"[INFO] lr automático = {lr}")
 
     train(
         resume_path = args.resume,

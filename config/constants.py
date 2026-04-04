@@ -11,12 +11,33 @@
 
 from pathlib import Path
 import json
-
 # ==================== DIRECCIONES RAM — ESTADO MAESTRO =======================
-# Encontrado vía scanner_fsm.py el 31/03/2026
+# Encontrado vía scanner_fsm.py el 31/03/2026.
+# Mapeo de estados (FSM) confirmado Abril 2026.
 GAME_STATE_ADDR = 0xFF8005
+
+# MAPA DE GAME_STATE — SF2CE CONFIRMADO
+GAME_STATE_BOOT_TITLE        = 0x00  # Boot / Título / Atraer (HP=0)
+GAME_STATE_INSERT_COIN       = 0x02  # Insert Coin / Press Start (HP=0)
+GAME_STATE_COMBAT_SELECT     = 0x04  # Char Select + VS Screen + Combate (HP>0 si en combate)
+GAME_STATE_ROUND_TRANSITION  = 0x06  # Transición / Round Over inter-rondas (HP=0)
+GAME_STATE_GAME_OVER         = 0x08  # Game Over / Continue (HP=0)
+GAME_STATE_CONTINUE_EXPIRED  = 0x0A  # Continue expirado → vuelta a título
+
+GAME_STATE_NAMES = {
+    GAME_STATE_BOOT_TITLE: "BOOT/TITLE",
+    GAME_STATE_INSERT_COIN: "INSERT_COIN/PRESS_START",
+    GAME_STATE_COMBAT_SELECT: "CHAR_SELECT/VS_SCREEN/COMBAT",
+    GAME_STATE_ROUND_TRANSITION: "ROUND_TRANSITION",
+    GAME_STATE_GAME_OVER: "GAME_OVER/CONTINUE",
+    GAME_STATE_CONTINUE_EXPIRED: "CONTINUE_EXPIRED"
+}
+
 def get_game_state(ram_reader) -> int:
     return ram_reader.read_u8(GAME_STATE_ADDR)
+
+def get_game_state_name(state_value: int) -> str:
+    return GAME_STATE_NAMES.get(state_value, f"UNKNOWN_STATE_{hex(state_value)}")
 
 
 # Lista de nombres para las 26 acciones de Blanka
@@ -39,25 +60,9 @@ P2_HP_DISPLAY2 = 0xFF86EB  # display secundario; lag 1-2f vs E9
 P1_SIDE_ADDR = 0xFF83D0   # 9 flips reales
 P2_SIDE_ADDR = 0xFF86D0   # 18 flips reales
 
-# --- PERSONAJES — DIRECCIÓN DEFINITIVA (confirmado 02/04/2026) ----------------
-#
-# ARQUITECTURA DE BLOQUES DE ENTIDAD EN CPS1 (SF2CE):
-#   Bloque P1 (Blanka): base 0xFF8300  →  0xFF8300 + 0x4F = 0xFF834F  (siempre 0, descartada)
-#   Bloque P2 (rival) : base 0xFF8600  →  0xFF8600 + 0x4F = 0xFF864F  ✅ char ID del rival activo
-#   Bloque P3 (entity): base 0xFF8900  →  0xFF8900 + 0x4F = 0xFF894F  ← era el bug
-#
-# DIAGNÓSTICO 02/04/2026 (diagnose_p2char.lua, dos terminales en paralelo):
-#   · 0xFF864F devuelve el char ID del rival Y SE ACTUALIZA entre combates del arcade.
-#     Terminal 1 (visible):  2 → Guile  todo el combate
-#     Terminal 2 (headless): 4 → Ken    combate 1
-#                            8 → M.Bison combate 2
-#                           11 → Vega   combate 3
-#   · 0xFF894F en headless devolvía siempre 3 (= Guile en CHAR_MAP).
-#     Esto era porque la entidad P3 es un slot auxiliar que SF2CE headless
-#     no reinicializa entre rondas; queda con el valor del primer char
-#     cargado en esa posición de memoria al inicio de la ROM.
-#
-# CONCLUSIÓN: usar 0xFF864F para leer el char ID de P2 en todo momento.
+# Rounds ganados — confirmado por escaneo diagnóstico Abril 2026
+P1_ROUND_WIN_SIG = 0xFF8A3F   # >0 cuando P1 acaba de ganar una ronda
+P2_ROUND_WIN_SIG = 0xFF8A41   # >0 cuando P2 acaba de ganar una ronda
 
 P2_CHAR_ADDR = 0xFF8660   # ✅ char ID del rival activo, se actualiza entre combates
 
